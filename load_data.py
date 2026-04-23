@@ -45,6 +45,19 @@ def charger_tout_le_dossier(dir_path="."): # Fonction permettant de charger tous
         except Exception as e:
             errors.append((name, str(e)))
             log(f"Erreur PDF '{name}'")
+            
+    # 3 . CSV
+    csv_paths = glob.glob(os.path.join(dir_path, "*.csv")) # chargement de tous les fichiers csv du dossier courant
+    for path in csv_paths: # boucle de chaque fichier csv
+        name = Path(path).name # report du nom par le nom du fichier csv
+        try:
+            df = pd.read_csv(path) # lecture du fichier csv
+            data[name] = {"type": "csv", "dataframe": df} # report du nom de chaque feuille d'un fichier excel
+            log(f"CSV '{name}' chargé")
+        except Exception as e:
+            errors.append((name, str(e)))
+            log(f"Erreur CSV '{name}'")
+    
 
     # 3. TXT
     text_paths = glob.glob(os.path.join(dir_path, "*.txt"))
