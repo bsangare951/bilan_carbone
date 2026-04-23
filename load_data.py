@@ -59,7 +59,7 @@ def charger_tout_le_dossier(dir_path="."): # Fonction permettant de charger tous
             log(f"Erreur CSV '{name}'")
     
 
-    # 3. TXT
+    # 4. TXT
     text_paths = glob.glob(os.path.join(dir_path, "*.txt"))
     for path in text_paths:
         name = Path(path).name
