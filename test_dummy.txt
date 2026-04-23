@@ -1,3 +1,7 @@
 Gaz naturel: 1500 kWh
 Électricité: 25000 kWh
 Grand livre compte 613: 50000 €
+
+Gaz naturel: 1500 kWh
+Électricité: 25000 kWh
+Grand livre compte 613: 50000 €

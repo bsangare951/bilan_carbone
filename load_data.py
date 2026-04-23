@@ -68,4 +68,3 @@ if __name__ == "__main__":
     print("\n Fichiers :", list(data.keys()))
     if errors:
         print("\ Erreurs :", [e[0] for e in errors])
-
