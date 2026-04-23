@@ -8,3 +8,14 @@ def puissance(a,n):
     return pow
 
 puissance(2,7)
+
+def factoriel(n):
+    if(n==0 or n==1):
+        return(n)
+    else:
+        return n*factoriel(n-1)
+
+r=factoriel(5)
+print(r)  
+    
+        
