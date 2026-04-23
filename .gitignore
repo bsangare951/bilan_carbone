@@ -1,13 +1,12 @@
-# Excel et données
 *.xlsx
 *.xls
 *.docx
 *.odt
 *.pdf
-
-# Lock files
 *lock.*
-
-# Autres
+*.csv
+*.odt
+*.txt
 .DS_Store
 Thumbs.db
+
