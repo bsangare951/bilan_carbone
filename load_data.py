@@ -1,10 +1,12 @@
-import pandas as pd 
-import os
-import pymupdf
-import re
-from pathlib import Path
-import glob
-import warnings
+import pandas as pd # ouverture des fichiers Excel/tableur
+import os # gestion des chemins de fichiers
+import pymupdf # lecture de fichiers PDF
+import re # gestion des expressions régulières pour extraire les données tabulaires des PDF
+from pathlib import Path # gestion des chemins de fichiers de manière plus portable
+import glob # pour trouver tous les fichiers d'un type donné dans un dossier
+import warnings # pour gérer les avertissements liés à l'ouverture de fichiers
+
+
 
 warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl') # Ignore les avertissements spécifiques d'openpyxl(les avertissements ne bloquent pas l'éxécution du programme)
 
@@ -81,3 +83,4 @@ if __name__ == "__main__":
     print("\n Fichiers :", list(data.keys()))
     if errors:
         print("\ Erreurs :", [e[0] for e in errors])
+
