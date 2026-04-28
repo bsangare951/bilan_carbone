@@ -13,11 +13,6 @@ EXCLUDED_FILES = {"support_bc.xlsx", "export_bc.xlsx"}
 def clean_excel(datas):
     cleaned_datas = {}
     output_dir = "cleaned_files"
-    
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-        print(f"[INFO] Dossier '{output_dir}' créé.")
-    
     for filename, content in datas.items():
         # Ignorer les fichiers déjà traités
         if filename.startswith("cleaned_"):
@@ -40,6 +35,7 @@ def clean_excel(datas):
 
                 # 2. Suppression uniquement des lignes totalement vides
                 df_clean = df_clean.dropna(how='all', axis=0)
+                print(f"[INFO] '{filename}' - '{sheet_name}': {len(df) - len(df_clean)} lignes vides supprimées.")
 
             except Exception as e:
                 print(f"[ERREUR] {filename} : {e}")
