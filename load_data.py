@@ -1,35 +1,58 @@
-import pandas as pd # ouverture des fichiers Excel/tableur
-import os # gestion des chemins de fichiers
-import pymupdf # lecture de fichiers PDF
-import re # gestion des expressions régulières pour extraire les données tabulaires des PDF
-from pathlib import Path # gestion des chemins de fichiers de manière plus portable
-import glob # pour trouver tous les fichiers d'un type donné dans un dossier
-import warnings # pour gérer les avertissements liés à l'ouverture de fichiers
+import pandas as pd 
+import os 
+import pymupdf 
+import re 
+from pathlib import Path 
+import glob 
+import warnings 
 
+warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
 
-
-warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl') # Ignore les avertissements spécifiques d'openpyxl(les avertissements ne bloquent pas l'éxécution du programme)
-
-def log(msg): # Fonction à utiliser pour le suivi des algorithmes
+def log(msg):
     print(f"[INFO] {msg}")
 
-def charger_tout_le_dossier(dir_path="."): # Fonction permettant de charger tous les fichiers du dossier courant
-    data = {} # initialisation d'un dictionnaire vide de fichier
-    errors = [] # Initialisation d'une liste de fichier erroné
+def charger_tout_le_dossier(dir_path="."):
+    data = {}
+    errors = []
     log("Scan du dossier...")
 
-    # 1. EXCEL
-    excel_paths = glob.glob(os.path.join(dir_path, "**", "*.xlsx"), recursive=True) + glob.glob(os.path.join(dir_path, "**", "*.xls"), recursive=True) + glob.glob(os.path.join(dir_path, "**", "*.xlsm"), recursive=True) # sélection des fichiers excel par formats
-    for path in excel_paths: # boucle pour chaque fichier excel
-        name = Path(path).name # report du nom apr le nom du fichier
+    # 1. EXCEL (MODIFIÉ POUR PLUS DE ROBUSTESSE)
+    excel_paths = glob.glob(os.path.join(dir_path, "**", "*.xlsx"), recursive=True) + \
+                  glob.glob(os.path.join(dir_path, "**", "*.xls"), recursive=True) + \
+                  glob.glob(os.path.join(dir_path, "**", "*.xlsm"), recursive=True)
+    
+    for path in excel_paths:
+        name = Path(path).name
+        # Ignorer les fichiers temporaires Excel
+        if name.startswith("~$"): continue
+        
         try:
-            sheets = pd.read_excel(path, sheet_name=None, engine="openpyxl") # lecture des feuilles excel
-            sheets = {k: pd.DataFrame(v) for k, v in sheets.items()} # conversion de chaque feuille en DataFrame pour faciliter le traitement ultérieur
-            data[name] = {"type": "excel", "sheets": sheets, "nb_sheets": len(sheets)} # report de nom de chaque feuille d'un fichier excel
-            log(f"Excel '{name}' chargé ({len(sheets)} feuilles)")
+            # Ouverture propre du fichier Excel
+            xls = pd.ExcelFile(path, engine="openpyxl")
+            processed_sheets = {}
+            
+            for sheet_name in xls.sheet_names:
+                # Lecture de la feuille
+                df = pd.read_excel(xls, sheet_name=sheet_name)
+                
+                # Vérification de sécurité : on ignore les feuilles vides
+                if df.empty or df.dropna(how='all').empty:
+                    continue
+                
+                processed_sheets[sheet_name] = df
+            
+            # Enregistrement des résultats
+            if processed_sheets:
+                data[name] = {
+                    "type": "excel", 
+                    "sheets": processed_sheets, 
+                    "nb_sheets": len(processed_sheets)
+                }
+                log(f"Excel '{name}' chargé : {len(processed_sheets)} feuilles détectées.")
+            
         except Exception as e:
-            errors.append((name, str(e))) # ajout si erreur, à la liste des fichiers erronés
-            log(f"Erreur Excel '{name}'")
+            errors.append((name, str(e)))
+            log(f"Erreur lors du chargement de '{name}': {e}")
 
     # 2. PDF
     pdf_paths = glob.glob(os.path.join(dir_path, "**", "*.pdf"), recursive=True) # chargement de tous les fichiers pdf du dossier courant et sous-dossiers
