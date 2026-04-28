@@ -1,57 +1,47 @@
-import pandas as pd 
-import numpy as np 
-from google import genai 
-from dotenv import load_dotenv 
-import os 
-import time 
-import load_data as ld 
+import pandas as pd
+import numpy as np
+import os
+import load_data as ld
+import openpyxl
 
 # Chargement de tous les fichiers
 datas, errors = ld.charger_tout_le_dossier(os.path.dirname(__file__))
 
-def clean_excel_secure(datas):
+# Fichiers à exclure
+EXCLUDED_FILES = {"support_bc.xlsx", "export_bc.xlsx"}
+
+def clean_excel(datas):
     cleaned_datas = {}
+    output_dir = "cleaned_files"
+    
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"[INFO] Dossier '{output_dir}' créé.")
     
     for filename, content in datas.items():
+        # Ignorer les fichiers déjà traités
+        if filename.startswith("cleaned_"):
+            continue
+
         if content["type"] != "excel":
             cleaned_datas[filename] = content
             continue
-            
+        
+        if filename in EXCLUDED_FILES:
+            cleaned_datas[filename] = content
+            print(f"[INFO] Fichier '{filename}' exclu")
+            continue
+
         cleaned_sheets = {}
         for sheet_name, df in content["sheets"].items():
-            df_clean = df.copy()
-            
-            # 1. Suppression des lignes et colonnes entièrement vides
-            df_clean = df_clean.dropna(how='all').dropna(axis=1, how='all')
-            
-            # 2. Nettoyage des noms de colonnes (Correction de l'erreur)
-            # On force la conversion en str pour éviter l'erreur sur les entiers
-            df_clean.columns = (df_clean.columns
-                               .astype(str)
-                               .str.strip()
-                               .str.lower()
-                               .str.replace(r'[^\w]+', '_', regex=True)
-                               .str.strip('_'))
-            
-            # 3. Trim des espaces dans les cellules texte (Correction du warning)
-            # Ajout de 'string' dans include et cast explicite en str
-            for col in df_clean.select_dtypes(include=['object', 'string']).columns:
-                df_clean[col] = df_clean[col].astype(str).str.strip()
-            
-            # 4. Conversion sécurisée des dates
-            for col in df_clean.columns:
-                if 'date' in col:
-                    # 'dayfirst=True' aide souvent à résoudre le UserWarning sur les formats
-                    converted = pd.to_datetime(df_clean[col], errors='coerce', dayfirst=True)
-                    if converted.isnull().sum() <= (len(df_clean) * 0.5):
-                        df_clean[col] = converted
-            
-            
-            cleaned_sheets[sheet_name] = df_clean
-            print(f"[INFO] Nettoyage fini pour {filename} ({sheet_name})")
-            
-        cleaned_datas[filename] = {**content, "sheets": cleaned_sheets}
-        
-    return cleaned_datas
+            try:
+                # 1. Copie brute, aucune modification de structure
+                df_clean = pd.DataFrame(df).copy()
 
-test = clean_excel_secure(datas)
+                # 2. Suppression uniquement des lignes totalement vides
+                df_clean = df_clean.dropna(how='all', axis=0)
+
+            except Exception as e:
+                print(f"[ERREUR] {filename} : {e}")
+
+test = clean_excel(datas)
