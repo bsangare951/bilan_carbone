@@ -101,10 +101,25 @@ def charger_tout_le_dossier(dir_path="."):
     log(f"{len(data)} fichiers chargés")
     return data, errors
 
+    # 5. DOCX
+    docx_paths = glob.glob(os.path.join(dir_path, "**", "*.docx"), recursive=True) # chargement de tous les fichiers docx du dossier courant et sous-dossiers
+    for path in docx_paths: # boucle de chaque fichier docx
+        name = Path(path).name # report du nom par le nom du fichier docx
+        try:
+            doc = openpyxl.load_workbook(path) # lecture du fichier docx
+            data[name] = {"type": "docx", "content": doc} # report du nom de chaque feuille d'un fichier excel
+            log(f"DOCX '{name}' chargé")
+        except Exception as e:
+            errors.append((name, str(e)))
+            log(f"Erreur DOCX '{name}'")
+
 if __name__ == "__main__": # point d'entrée du programme
     print("Chargement des fichiers ...")
     data, errors = charger_tout_le_dossier(".") # chargement de tous les fichiers du dossier courant
     print("\n Fichiers :", list(data.keys()))
     if errors:
         print("\ Erreurs :", [e[0] for e in errors])
+
+    
+    
 

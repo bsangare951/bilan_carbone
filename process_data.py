@@ -4,7 +4,6 @@ import os
 import load_data as ld
 import openpyxl
 import re
-import csv
 
 # Chargement de tous les fichiers
 datas, errors = ld.charger_tout_le_dossier(os.path.dirname(__file__))
