@@ -19,11 +19,12 @@ def charger_tout_le_dossier(dir_path="."): # Fonction permettant de charger tous
     log("Scan du dossier...")
 
     # 1. EXCEL
-    excel_paths = glob.glob(os.path.join(dir_path, "*.xlsx")) + glob.glob(os.path.join(dir_path, "*.xls")) # sélection des fichiers excel par formats
+    excel_paths = glob.glob(os.path.join(dir_path, "**", "*.xlsx"), recursive=True) + glob.glob(os.path.join(dir_path, "**", "*.xls"), recursive=True) + glob.glob(os.path.join(dir_path, "**", "*.xlsm"), recursive=True) # sélection des fichiers excel par formats
     for path in excel_paths: # boucle pour chaque fichier excel
         name = Path(path).name # report du nom apr le nom du fichier
         try:
             sheets = pd.read_excel(path, sheet_name=None, engine="openpyxl") # lecture des feuilles excel
+            sheets = {k: pd.DataFrame(v) for k, v in sheets.items()} # conversion de chaque feuille en DataFrame pour faciliter le traitement ultérieur
             data[name] = {"type": "excel", "sheets": sheets, "nb_sheets": len(sheets)} # report de nom de chaque feuille d'un fichier excel
             log(f"Excel '{name}' chargé ({len(sheets)} feuilles)")
         except Exception as e:
@@ -31,7 +32,7 @@ def charger_tout_le_dossier(dir_path="."): # Fonction permettant de charger tous
             log(f"Erreur Excel '{name}'")
 
     # 2. PDF
-    pdf_paths = glob.glob(os.path.join(dir_path, "*.pdf")) # chargement de tous les fichiers pdf du dossier courant
+    pdf_paths = glob.glob(os.path.join(dir_path, "**", "*.pdf"), recursive=True) # chargement de tous les fichiers pdf du dossier courant et sous-dossiers
     for path in pdf_paths: # boucle de chaque fichier pdf 
         name = Path(path).name # report du nom par le nom du fichier pdf
         try:
@@ -49,7 +50,7 @@ def charger_tout_le_dossier(dir_path="."): # Fonction permettant de charger tous
             log(f"Erreur PDF '{name}'")
             
     # 3 . CSV
-    csv_paths = glob.glob(os.path.join(dir_path, "*.csv")) # chargement de tous les fichiers csv du dossier courant
+    csv_paths = glob.glob(os.path.join(dir_path, "**", "*.csv"), recursive=True) # chargement de tous les fichiers csv du dossier courant
     for path in csv_paths: # boucle de chaque fichier csv
         name = Path(path).name # report du nom par le nom du fichier csv
         try:
@@ -62,14 +63,14 @@ def charger_tout_le_dossier(dir_path="."): # Fonction permettant de charger tous
     
 
     # 4. TXT
-    text_paths = glob.glob(os.path.join(dir_path, "*.txt"))
-    for path in text_paths:
-        name = Path(path).name
+    text_paths = glob.glob(os.path.join(dir_path, "**", "*.txt"), recursive=True) # chargement de tous les fichiers txt du dossier courant et sous-dossiers
+    for path in text_paths: # boucle de chaque fichier txt
+        name = Path(path).name # report du nom par le nom du fichier txt
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f: # lecture du fichier txt, en ignorant les erreurs d'encodage
                 content = f.read()
-            data[name] = {"type": "text", "content": content}
-            log(f"TXT '{name}' chargé")
+            data[name] = {"type": "text", "content": content} # report du nom de chaque feuille d'un fichier excel
+            log(f"TXT '{name}' chargé") 
         except Exception as e:
             errors.append((name, str(e)))
             log(f"Erreur TXT '{name}'")
@@ -77,9 +78,9 @@ def charger_tout_le_dossier(dir_path="."): # Fonction permettant de charger tous
     log(f"{len(data)} fichiers chargés")
     return data, errors
 
-if __name__ == "__main__":
+if __name__ == "__main__": # point d'entrée du programme
     print("Chargement des fichiers ...")
-    data, errors = charger_tout_le_dossier(".")
+    data, errors = charger_tout_le_dossier(".") # chargement de tous les fichiers du dossier courant
     print("\n Fichiers :", list(data.keys()))
     if errors:
         print("\ Erreurs :", [e[0] for e in errors])
