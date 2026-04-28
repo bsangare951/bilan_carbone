@@ -16,7 +16,7 @@ def charger_tout_le_dossier(dir_path="."):
     errors = []
     log("Scan du dossier...")
 
-    # 1. EXCEL (MODIFIÉ POUR PLUS DE ROBUSTESSE)
+    # 1. EXCEL 
     excel_paths = glob.glob(os.path.join(dir_path, "**", "*.xlsx"), recursive=True) + \
                   glob.glob(os.path.join(dir_path, "**", "*.xls"), recursive=True) + \
                   glob.glob(os.path.join(dir_path, "**", "*.xlsm"), recursive=True)
