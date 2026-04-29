@@ -4,6 +4,7 @@ import os
 import load_data as ld
 import openpyxl
 import re
+import csv
 
 # Chargement de tous les fichiers
 datas, errors = ld.charger_tout_le_dossier(os.path.dirname(__file__))
@@ -14,9 +15,11 @@ EXCLUDED_FILES = {"support_bc.xlsx", "export_bc.xlsx"}
 def clean_excel(datas):
     cleaned_datas = {}
     output_dir = "cleaned_files"
+
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         print(f"[INFO] Dossier '{output_dir}' créé.")
+
     for filename, content in datas.items():
         # Ignorer les fichiers déjà traités
         if filename.startswith("cleaned_"):
@@ -32,6 +35,7 @@ def clean_excel(datas):
             continue
 
         cleaned_sheets = {}
+
         for sheet_name, df in content["sheets"].items():
             try:
                 # 1. Copie brute, aucune modification de structure
@@ -40,17 +44,38 @@ def clean_excel(datas):
                 # 2. Suppression uniquement des lignes totalement vides
                 df_clean = df_clean.dropna(how='all', axis=0)
                 print(f"[INFO] '{filename}' - '{sheet_name}': {len(df) - len(df_clean)} lignes vides supprimées.")
-                # 3. Sauvegarde sans rien renommer ni supprimer
-                '''clean_filename = f"cleaned_{filename.replace('.xlsx', '').replace('.xls', '')}_{sheet_name}.csv"
+
+                # 3. Nettoyage des cellules
+                for col in df_clean.columns:
+                    if df_clean[col].dtype == "object":
+                        df_clean[col] = (
+                            df_clean[col]
+                            .astype(str)
+                            .str.replace("\n", " ", regex=False)
+                            .str.replace("\r", " ", regex=False)
+                            .str.replace(";", ",", regex=False)
+                        )
+
+                # 4. Sauvegarde
+                clean_filename = f"cleaned_{filename.replace('.xlsx', '').replace('.xls', '')}_{sheet_name}.csv"
                 save_path = os.path.join(output_dir, clean_filename)
-                
-                df_clean.to_csv(save_path, index=False, sep=';', encoding='utf-8-sig') 
-                
+
+                # Export CSV 
+                df_clean.to_csv(
+                    save_path,
+                    index=False,
+                    sep=';',
+                    encoding='utf-8-sig',
+                    quoting=csv.QUOTE_ALL
+                )
+
                 cleaned_sheets[sheet_name] = df_clean
-                print(f"[OK] Sauvegardé sans perte : {save_path}")'''
+                print(f"[OK] Sauvegardé sans perte : {save_path}")
 
             except Exception as e:
                 print(f"[ERREUR] {filename} : {e}")
+
+    return cleaned_datas
 
 
 def clean_PDF(datas):
