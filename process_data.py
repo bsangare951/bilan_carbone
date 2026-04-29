@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import os
 import load_data as ld
-import openpyxl
+import docx
 import re
 import csv
 
@@ -26,7 +26,7 @@ def clean_excel(datas):
             continue
 
         if content["type"] != "excel":
-            cleaned_datas[filename] = content
+            cleaned_datas[filename] = content # Si ce n'est pas un excel, on le garde tel quel
             continue
         
         if filename in EXCLUDED_FILES:
@@ -57,7 +57,7 @@ def clean_excel(datas):
                         )
 
                 # 4. Sauvegarde
-                '''clean_filename = f"cleaned_{filename.replace('.xlsx', '').replace('.xls', '')}_{sheet_name}.csv"
+                clean_filename = f"cleaned_{filename.replace('.xlsx', '').replace('.xls', '')}_{sheet_name}.csv"
                 save_path = os.path.join(output_dir, clean_filename)
 
                 # Export CSV 
@@ -70,7 +70,7 @@ def clean_excel(datas):
                 )
 
                 cleaned_sheets[sheet_name] = df_clean
-                print(f"[OK] Sauvegardé sans perte : {save_path}")'''
+                print(f"[OK] Sauvegardé sans perte : {save_path}")
 
             except Exception as e:
                 print(f"[ERREUR] {filename} : {e}")
@@ -87,6 +87,9 @@ def clean_PDF(datas):
     
     for filename, content in datas.items():
         if content.get("type") != "pdf":
+            cleaned_datas[filename] = content # Si ce n'est pas un pdf, on le garde tel quel
+            continue
+        if filename.startswith("cleaned_"):
             cleaned_datas[filename] = content
             continue
             
@@ -100,7 +103,7 @@ def clean_PDF(datas):
             text = re.sub(r' +', ' ', text)
             text = re.sub(r'[^\x00-\x7F]+', ' ', text)
             cleaned_content = text.strip()
-            '''
+            
             # Sauvegarde en TXT
             txt_path = os.path.join(output_dir, f"cleaned_{filename.replace('.pdf', '.txt')}")
             with open(txt_path, "w", encoding="utf-8") as f:
@@ -112,7 +115,7 @@ def clean_PDF(datas):
                     writer = csv.writer(f, delimiter=';')
                     writer.writerow(['Date', 'ID', 'Montant'])
                     writer.writerows(tables_regex)
-                print(f"[OK] Données tabulaires extraites en CSV pour '{filename}'.") '''
+                print(f"[OK] Données tabulaires extraites en CSV pour '{filename}'.") 
 
             
             cleaned_datas[filename] = {
@@ -136,6 +139,9 @@ def clean_CSV(datas):
     
     for filename, content in datas.items():
         if content.get("type") != "csv":
+            cleaned_datas[filename] = content # Si ce n'est pas un csv, on le garde tel quel
+            continue
+        if filename.startswith("cleaned_"):
             cleaned_datas[filename] = content
             continue
             
@@ -157,7 +163,7 @@ def clean_CSV(datas):
                     )
             
             # Sauvegarde en CSV
-            '''clean_filename = f"cleaned_{filename}"
+            clean_filename = f"cleaned_{filename}"
             save_path = os.path.join(output_dir, clean_filename)
             df.to_csv(
                 save_path,
@@ -166,7 +172,7 @@ def clean_CSV(datas):
                 encoding='utf-8-sig',
                 quoting=csv.QUOTE_ALL
             )
-            print(f"[OK] CSV '{filename}' nettoyé et sauvegardé : {save_path}")'''
+            print(f"[OK] CSV '{filename}' nettoyé et sauvegardé : {save_path}")
             
             cleaned_datas[filename] = {
                 "type": "csv",
@@ -177,3 +183,54 @@ def clean_CSV(datas):
             print(f"[ERREUR] {filename} : {e}")
     
     return cleaned_datas
+
+
+def clean_DOCX(datas):
+    output_dir = "cleaned_files"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        
+    cleaned_datas = {}
+    
+    for filename, content in datas.items():
+        if content.get("type") != "docx":
+            cleaned_datas[filename] = content
+            continue
+        if filename.startswith("cleaned_"):
+            cleaned_datas[filename] = content
+            continue
+            
+        try:
+            doc = content.get("document")
+            tables_regex = content.get("tables_regex", [])
+            
+            # 1. Extraction et nettoyage global
+            full_text = "\n".join([para.text for para in doc.paragraphs])
+            full_text = re.sub(r'\n+', '\n', full_text)
+            full_text = re.sub(r' +', ' ', full_text)
+            cleaned_content = re.sub(r'[^\x00-\x7F]+', ' ', full_text).strip()
+            
+            # 2. Sauvegarde unique en TXT
+            txt_path = os.path.join(output_dir, f"cleaned_{filename.replace('.docx', '.txt')}")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(cleaned_content)
+            
+            # 3. Sauvegarde des tableaux en CSV (si présents)
+            if tables_regex:
+                csv_path = os.path.join(output_dir, f"cleaned_{filename.replace('.docx', '.csv')}")
+                with open(csv_path, "w", encoding="utf-8", newline='') as f:
+                    writer = csv.writer(f, delimiter=';')
+                    writer.writerow(['Date', 'ID', 'Montant'])
+                    writer.writerows(tables_regex)
+            
+            cleaned_datas[filename] = {"type": "docx", "content": cleaned_content}
+            print(f"[OK] DOCX '{filename}' nettoyé.")
+            
+        except Exception as e:
+            print(f"[ERREUR] {filename} : {e}")
+            
+    return cleaned_datas
+
+
+
+
