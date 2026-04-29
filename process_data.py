@@ -57,7 +57,7 @@ def clean_excel(datas):
                         )
 
                 # 4. Sauvegarde
-                clean_filename = f"cleaned_{filename.replace('.xlsx', '').replace('.xls', '')}_{sheet_name}.csv"
+                '''clean_filename = f"cleaned_{filename.replace('.xlsx', '').replace('.xls', '')}_{sheet_name}.csv"
                 save_path = os.path.join(output_dir, clean_filename)
 
                 # Export CSV 
@@ -70,7 +70,7 @@ def clean_excel(datas):
                 )
 
                 cleaned_sheets[sheet_name] = df_clean
-                print(f"[OK] Sauvegardé sans perte : {save_path}")
+                print(f"[OK] Sauvegardé sans perte : {save_path}")'''
 
             except Exception as e:
                 print(f"[ERREUR] {filename} : {e}")
@@ -126,4 +126,54 @@ def clean_PDF(datas):
     
     return cleaned_datas
 
-test = clean_excel(datas)
+
+def clean_CSV(datas):
+    output_dir = "cleaned_files"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        
+    cleaned_datas = {}
+    
+    for filename, content in datas.items():
+        if content.get("type") != "csv":
+            cleaned_datas[filename] = content
+            continue
+            
+        try:
+            df = content.get("dataframe")
+            if df is None:
+                print(f"[ERREUR] {filename} : DataFrame manquant.")
+                continue
+            
+            # Nettoyage des données
+            for col in df.columns:
+                if df[col].dtype == "object":
+                    df[col] = (
+                        df[col]
+                        .astype(str)
+                        .str.replace("\n", " ", regex=False)
+                        .str.replace("\r", " ", regex=False)
+                        .str.replace(";", ",", regex=False)
+                    )
+            
+            # Sauvegarde en CSV
+            '''clean_filename = f"cleaned_{filename}"
+            save_path = os.path.join(output_dir, clean_filename)
+            df.to_csv(
+                save_path,
+                index=False,
+                sep=';',
+                encoding='utf-8-sig',
+                quoting=csv.QUOTE_ALL
+            )
+            print(f"[OK] CSV '{filename}' nettoyé et sauvegardé : {save_path}")'''
+            
+            cleaned_datas[filename] = {
+                "type": "csv",
+                "dataframe": df
+            }
+            
+        except Exception as e:
+            print(f"[ERREUR] {filename} : {e}")
+    
+    return cleaned_datas
