@@ -113,6 +113,19 @@ def charger_tout_le_dossier(dir_path="."):
             errors.append((name, str(e)))
             log(f"Erreur DOCX '{name}'")
 
+    # 6. JPEG
+    jpg_paths = glob.glob(os.path.join(dir_path, "**", "*.jpg"), recursive=True) + glob.glob(os.path.join(dir_path, "**", "*.jpeg"), recursive=True) # chargement de tous les fichiers jpg et jpeg du dossier courant et sous-dossiers
+    for path in jpg_paths: # boucle de chaque fichier jpg et jpeg
+        name = Path(path).name # report du nom par le nom du fichier jpg ou jpeg
+        try:
+            img = Image.open(path) # lecture du fichier jpg ou jpeg
+            data[name] = {"type": "image", "content": img} # report du nom de chaque feuille d'un fichier excel
+            log(f"JPEG '{name}' chargé")
+        except Exception as e:
+            errors.append((name, str(e)))
+            log(f"Erreur JPEG '{name}'")
+
+
 if __name__ == "__main__": # point d'entrée du programme
     print("Chargement des fichiers ...")
     data, errors = charger_tout_le_dossier(".") # chargement de tous les fichiers du dossier courant
