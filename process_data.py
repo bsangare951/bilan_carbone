@@ -5,7 +5,7 @@ import load_data as ld
 import docx
 import re
 import csv
-from pathlib import Path
+import shutil
 
 # Chargement de tous les fichiers
 datas, errors = ld.charger_tout_le_dossier(os.path.dirname(__file__))
@@ -238,43 +238,25 @@ def clean_JPEG(datas):
     output_dir = "cleaned_files"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    
-    cleaned_datas = {}
-    
+
     for filename, content in datas.items():
         f_type = str(content.get("type", "")).lower()
         
-        if f_type not in ["jpeg", "jpg"] or filename.startswith("cleaned_"):
-            cleaned_datas[filename] = content
-            continue
+        if f_type in ["jpg", "jpeg"]:
+            source_path = content.get("image_object").filename if content.get("image_object") else None
+            if not source_path:
+                print(f"[ERREUR] {filename} : Chemin de l'image introuvable.")
+                continue
+            new_path = os.path.join(output_dir, f"cleaned_{filename}")
             
-        try:
-            img = content.get("image_object")
-            
-            # OCR
-            text = pytesseract.image_to_string(img, lang='eng', config='--psm 11')
-            
-            # Nettoyage
-            text = re.sub(r'\n+', '\n', text)
-            text = re.sub(r' +', ' ', text)
-            cleaned_content = re.sub(r'[^\x00-\x7F]+', ' ', text).strip()
-            base_name = Path(filename).stem 
-            txt_filename = f"cleaned_{base_name}.txt"
-            txt_path = os.path.join(output_dir, txt_filename)
-            
-            with open(txt_path, "w", encoding="utf-8") as f: 
-                f.write(cleaned_content)
-            
-            cleaned_datas[filename] = {
-                "type": "txt", 
-                "content": cleaned_content
-            }
-            
-            print(f"[OK] JPEG '{filename}' -> '{txt_filename}' généré.")
-            
-        except Exception as e:
-            print(f"[ERREUR] {filename} : {e}")
-            
-    return cleaned_datas
+            try:
+                # Copie 
+                shutil.copy2(source_path, new_path) 
+                print(f"[OK] {filename} copié vers {output_dir}")
+            except FileNotFoundError:
+                print(f"[ERREUR] Le fichier {filename} est introuvable à la racine.")
+            except Exception as e:
+                print(f"[ERREUR] {filename} : {e}")
 
-test = clean_JPEG(datas)
+    return datas
+
