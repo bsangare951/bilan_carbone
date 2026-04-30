@@ -4,7 +4,9 @@ import pymupdf
 import re 
 from pathlib import Path 
 import glob 
-import warnings 
+import warnings
+from PIL import Image
+from docx import Document
 
 warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
 
@@ -92,38 +94,42 @@ def charger_tout_le_dossier(dir_path="."):
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f: # lecture du fichier txt, en ignorant les erreurs d'encodage
                 content = f.read()
-            data[name] = {"type": "text", "content": content} # report du nom de chaque feuille d'un fichier excel
+            data[name] = {"type": "docx", "document": doc} # report du nom de chaque feuille d'un fichier excel
             log(f"TXT '{name}' chargé") 
         except Exception as e:
             errors.append((name, str(e)))
             log(f"Erreur TXT '{name}'")
 
-    log(f"{len(data)} fichiers chargés")
-    return data, errors
 
-    # 5. DOCX
-    docx_paths = glob.glob(os.path.join(dir_path, "**", "*.docx"), recursive=True) # chargement de tous les fichiers docx du dossier courant et sous-dossiers
-    for path in docx_paths: # boucle de chaque fichier docx
-        name = Path(path).name # report du nom par le nom du fichier docx
+   # 5. DOCX
+    docx_paths = glob.glob(os.path.join(dir_path, "**", "*.docx"), recursive=True)
+    for path in docx_paths:
+        name = Path(path).name
         try:
-            doc = openpyxl.load_workbook(path) # lecture du fichier docx
-            data[name] = {"type": "docx", "content": doc} # report du nom de chaque feuille d'un fichier excel
+            from docx import Document
+            doc = Document(path) # Correction ici 
+            data[name] = {"type": "docx", "document": doc} 
             log(f"DOCX '{name}' chargé")
         except Exception as e:
             errors.append((name, str(e)))
-            log(f"Erreur DOCX '{name}'")
+            log(f"Erreur DOCX '{name}' : {e}")
 
-    # 6. JPEG
-    jpg_paths = glob.glob(os.path.join(dir_path, "**", "*.jpg"), recursive=True) + glob.glob(os.path.join(dir_path, "**", "*.jpeg"), recursive=True) # chargement de tous les fichiers jpg et jpeg du dossier courant et sous-dossiers
-    for path in jpg_paths: # boucle de chaque fichier jpg et jpeg
-        name = Path(path).name # report du nom par le nom du fichier jpg ou jpeg
+    # 6. JPEG / JPG
+    jpg_paths = glob.glob(os.path.join(dir_path, "**", "*.jpg"), recursive=True) + \
+                glob.glob(os.path.join(dir_path, "**", "*.jpeg"), recursive=True)
+    for path in jpg_paths:
+        name = Path(path).name
         try:
-            img = Image.open(path) # lecture du fichier jpg ou jpeg
-            data[name] = {"type": "image", "content": img} # report du nom de chaque feuille d'un fichier excel
+            img = Image.open(path)
+            data[name] = {"type": "jpg", "image_object": img} 
             log(f"JPEG '{name}' chargé")
         except Exception as e:
             errors.append((name, str(e)))
-            log(f"Erreur JPEG '{name}'")
+            log(f"Erreur JPEG '{name}' : {e}")
+    
+    log(f"{len(data)} fichiers chargés")
+
+    return data, errors
 
 
 if __name__ == "__main__": # point d'entrée du programme
