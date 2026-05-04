@@ -190,49 +190,24 @@ def clean_DOCX(datas):
     output_dir = "cleaned_files"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-        
-    cleaned_datas = {}
-    
-    for filename, content in datas.items():
-        if content.get("type") != "docx" or filename.startswith("cleaned_"):
-            cleaned_datas[filename] = content
-            continue
-            
-        try:
-            doc = content.get("document")
-            tables_regex = content.get("tables_regex", [])
-            
-            # 1. Extraction et nettoyage du texte
-            full_text = "\n".join([para.text for para in doc.paragraphs])
-            full_text = re.sub(r'\n+', '\n', full_text)
-            full_text = re.sub(r' +', ' ', full_text)
-            cleaned_content = re.sub(r'[^\x00-\x7F]+', ' ', full_text).strip()
-            
-            # 2. Sauvegarde TXT
-            txt_path = os.path.join(output_dir, f"cleaned_{filename.replace('.docx', '.txt')}")
-            with open(txt_path, "w", encoding="utf-8-sig") as f:
-                f.write(cleaned_content)
-            
-            # 3. Sauvegarde CSV (Tableaux)
-            if tables_regex:
-                csv_path = os.path.join(output_dir, f"cleaned_{filename.replace('.docx', '.csv')}")
-                with open(csv_path, "w", encoding="utf-8-sig", newline='') as f:
-                    writer = csv.writer(f, delimiter=';')
-                    writer.writerow(['Date', 'ID', 'Prix','Energie','Emissions','Type','Déchets','Transport','Autres','Total','Immobilisation'])
-                    writer.writerows(tables_regex)
-            
-            cleaned_datas[filename] = {
-                "type": "docx", 
-                "content": cleaned_content,
-                "tables": tables_regex  # Ajoute ceci pour ne pas perdre les tableaux en mémoire
-            }
-            print(f"[OK] DOCX '{filename}' nettoyé.")
-            
-        except Exception as e:
-            print(f"[ERREUR] {filename} : {e}")
-            
-    return cleaned_datas
 
+    for filename, content in datas.items():
+        f_type = str(content.get("type", "")).lower()
+        
+        if f_type == "docx":
+            source_path = filename 
+            new_path = os.path.join(output_dir, f"cleaned_{filename}")
+            
+            try:
+                # On fait une copie physique bit à bit
+                shutil.copy2(source_path, new_path) 
+                print(f"[OK] {filename} copié vers {output_dir}")
+            except FileNotFoundError:
+                print(f"[ERREUR] Impossible de trouver le fichier '{filename}'.")
+            except Exception as e:
+                print(f"[ERREUR] {filename} : {e}")
+                
+    return datas
 
 def clean_JPEG(datas):
     output_dir = "cleaned_files"
@@ -260,3 +235,4 @@ def clean_JPEG(datas):
 
     return datas
 
+test = clean_DOCX(datas)
