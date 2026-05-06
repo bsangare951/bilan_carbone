@@ -1,188 +1,127 @@
 import os
-from dotenv import load_dotenv
-import load_data as ld
-import process_data as pt
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import pandas as pd
-import pytesseract
 import pymupdf
 from PIL import Image
 from docx import Document
- 
- 
-def get_units_referential():
-    return {
-        "ENERGIE": ["kWh", "MWh", "m3", "L"],
-        "TRANSPORT": ["km", "L", "passager.km", "t.km"],
-        "DECHETS": ["kg", "t"],
-        "IMMOBILISATION": ["m2", "unite", "kg"],
-        "AUTRES": ["€", "k€"]
-    }
- 
-def get_vehicle_attributes():
-    return ["type", "marque", "modèle", "année", "carburant", "puissance_fiscale"]
- 
-def get_carbon_schema():
-    return {
-        "Nom-Fichier": None,
-        "Date": None,
-        "ID_Facture": None,
-        "Designation": None,
-        "Prix": 0.0,
-        "Quantite": 0.0,
-        "Unite": None,
-        "Details_Vehicule": {
-            "Marque_Modele": None,
-            "Carburant": None,
-            "Type": None
-        },
-        "Emissions_tCO2e": 0.0
-    }
- 
-def get_scope():
-    return {
-        "SCOPE_1": {
-            "nom": "émissions directes",
-            "mot-clés": ["gaz naturel", "fioul", "diesel", "essence", "propane", "butane", "charbon", "biomasse"],
-            "description": "Émissions directes provenant de sources possédées ou contrôlées par l'entreprise, telles que la combustion de carburant dans les véhicules de l'entreprise ou les émissions fugitives."
-        },
-        "SCOPE_2": {
-            "nom": "émissions indirectes liées à l'énergie",
-            "mot-clés": ["électricité", "chauffage", "refroidissement", "vapeur"],
-            "description": "Émissions indirectes provenant de la consommation d'électricité, de chauffage ou de refroidissement achetés par l'entreprise."
-        },
-        "SCOPE_3": {
-            "nom": "autres émissions indirectes",
-            "mot-clés": ["transport de marchandises", "déchets", "immobilisations", "autres"],
-            "description": "Toutes les autres émissions indirectes qui se produisent dans la chaîne de valeur de l'entreprise, y compris les émissions liées au transport de marchandises, à la gestion des déchets, à l'utilisation des produits vendus, etc."
-        }
-    }
- 
-model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
- 
-# Exemples de référence enrichis pour chaque scope
-SCOPE_EXAMPLES = {
+
+model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2") # modèle léger et rapide pour les tests, à remplacer par un modèle plus puissant si besoin
+
+# Les textes de référence pour chaque scope
+SCOPES = {
     "SCOPE_1": (
-        "diesel essence carburant gaz naturel véhicule combustion fioul propane butane "
-        "charbon biomasse émissions directes plein carburant station service litres"
+        "Facture de carburant diesel essence pour véhicule de société. "
+        "Consommation de gaz naturel fioul propane butane charbon biomasse. "
+        "Émissions directes combustion station service plein litres. "
+        "Flotte véhicules entreprise carburant fossile."
     ),
     "SCOPE_2": (
-        "électricité kWh MWh chauffage énergie achetée consommation électrique facture EDF "
-        "fournisseur énergie refroidissement vapeur compteur abonnement"
+        "Facture d'électricité EDF fournisseur d'énergie consommation kWh MWh. "
+        "Abonnement électrique compteur relevé de compteur chauffage urbain. "
+        "Énergie achetée refroidissement vapeur consommation électrique bâtiment."
     ),
     "SCOPE_3": (
-        "transport marchandises déchets fournisseur logistique sous-traitant livraison "
-        "immobilisations achat matières premières prestataire bilan carbone indirect"
+        "Transport de marchandises logistique sous-traitant prestataire livraison. "
+        "Gestion des déchets collecte tri recyclage valorisation tonnes kilogrammes. "
+        "Immobilisations achat matières premières fournisseur bilan carbone indirect. "
+        "Déplacements domicile travail déchets suivi tonnes transporteurs sites."
     ),
 }
- 
-def cosine_similarity(a, b):
+
+def cosine_similarity(a, b): # calcul de la similarité cosinus entre deux vecteurs
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-def chunk_text(text, size=150):
+def chunk_text(text, size=150): # découpage du texte en morceaux de 150 mots pour une meilleure classification
     words = text.split()
     return [" ".join(words[i:i+size]) for i in range(0, len(words), size)]
- 
- 
-# Calcul des vecteurs d'embedding pour les mots-clés de chaque scope
-scope_vectors = {}
-for scope, text in SCOPE_EXAMPLES.items():
-    scope_vectors[scope] = model.encode(text)
- 
- 
-def classify_scope(text):
-    if not text or len(text.strip()) < 100:
-        return "UNKNOWN"
- 
+
+# Précalcul des vecteurs de référence
+scope_vectors = {scope: model.encode(text) for scope, text in SCOPES.items()}
+
+def classify_scope(text): # classification du texte dans un scope en fonction de la similarité avec les textes de référence
+    if not text or len(text.strip()) < 30:  
+        return "USELESS"
+
     chunks = chunk_text(text)
- 
-    best_scope = "UNKNOWN"
+    best_scope = "USELESS"
     best_score = -1
- 
-    for chunk in chunks:
+
+    for chunk in chunks: # calcul du vecteur du chunk et comparaison avec les vecteurs de référence pour trouver le scope le plus similaire
         vec = model.encode(chunk)
- 
         for scope, scope_vec in scope_vectors.items():
             score = cosine_similarity(vec, scope_vec)
- 
             if score > best_score:
                 best_score = score
                 best_scope = scope
- 
-    print(f"  [DEBUG] score={best_score:.3f} → {best_scope}")
-    if best_score < 0.10:
-        return "Fichier non traitable"
- 
+
+    print(f" score={best_score:.3f} → {best_scope}")
+
+    if best_score < 0.20: 
+        return "USELESS"
+
     return best_scope
- 
- 
-def extract_text(path):
+
+
+def extract_text(path): # extraction du texte d'un fichier en fonction de son extension, avec gestion des erreurs et des encodages pour les fichiers texte et CSV
     ext = path.lower().split(".")[-1]
- 
+
     try:
-        # TXT
         if ext == "txt":
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 return f.read()
- 
-        # CSV
+
         elif ext == "csv":
-            df = pd.read_csv(path, sep=None, engine="python", encoding="latin1", on_bad_lines='skip')
-            content = df.astype(str).fillna('').values.flatten()
-            return " ".join([str(item) for item in content if str(item).lower() != 'nan'])
- 
-        # EXCEL
+            df = pd.read_csv(
+                path, sep=None, engine="python",
+                encoding="latin1", on_bad_lines='skip', nrows=100
+            )
+            content = df.fillna('').astype(str).values.flatten()
+            return " ".join([item for item in content if item.strip() not in ('', 'nan')])
+
         elif ext in ["xls", "xlsx", "xlsm"]:
             df = pd.read_excel(path)
-            content = df.astype(str).fillna('').values.flatten()
-            return " ".join([str(item) for item in content if str(item).lower() != 'nan'])
- 
-        # DOCX
+            content = df.fillna('').astype(str).values.flatten()
+            return " ".join([item for item in content if item.strip() not in ('', 'nan')])
+
         elif ext == "docx":
             doc = Document(path)
             return "\n".join([p.text for p in doc.paragraphs])
- 
-        # PDF (PyMuPDF)
+
         elif ext == "pdf":
             doc = pymupdf.open(path)
             text = ""
             for page in doc:
                 text += page.get_text("text")
             return text
- 
+
         else:
             return ""
- 
+
     except Exception as e:
         print("Erreur extraction:", path, e)
         return ""
- 
- 
-def run_test(folder="cleaned_files"):
+
+
+def run_test(folder="cleaned_files"): # test de classification sur les fichiers nettoyés, avec extraction du texte et classification dans les scopes
     results = {}
- 
-    for file in os.listdir(folder):
+
+    for file in os.listdir(folder): # parcours des fichiers du dossier, extraction du texte et classification
         path = os.path.join(folder, file)
- 
         if not os.path.isfile(path):
             continue
- 
+
         print("\n---", file)
- 
         text = extract_text(path)
         scope = classify_scope(text)
- 
         print("→", scope)
- 
         results[file] = scope
- 
+
     return results
- 
- 
-if __name__ == "__main__":
+
+
+if __name__ == "__main__": # exécution du test de classification et affichage des résultats
     results = run_test()
- 
     print("\nRÉSULTATS")
-    for k, v in results.items():
+    for k, v in results.items(): # affichage du nom du fichier et du scope classifié pour chaque fichier testé
         print(k, ":", v)
