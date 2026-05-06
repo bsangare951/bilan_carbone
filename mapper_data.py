@@ -5,6 +5,8 @@ import pandas as pd
 import pymupdf
 from PIL import Image
 from docx import Document
+import load_data
+import process_data
 
 model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2") # modèle léger et rapide pour les tests, à remplacer par un modèle plus puissant si besoin
 
@@ -119,9 +121,33 @@ def run_test(folder="cleaned_files"): # test de classification sur les fichiers 
 
     return results
 
+import shutil # Pour copier ou déplacer les fichiers
+
+def export_per_scope(results, source_folder="cleaned_files"):
+    for file_name, scope in results.items():
+        # Si le fichier est utile (SCOPE_1, 2 ou 3)
+        if scope in ["SCOPE_1", "SCOPE_2", "SCOPE_3"]:
+            
+            # Créer le dossier du scope s'il n'existe pas
+            if not os.path.exists(scope):
+                os.makedirs(scope)
+            
+            # chemins source et destination
+            src_path = os.path.join(source_folder, file_name)
+            dst_path = os.path.join(scope, file_name)
+            
+            # Copier le fichier dans le bon dossier
+            try:
+                shutil.copy(src_path, dst_path)
+                print(f"Copié : {file_name} -> {scope}/")
+            except Exception as e:
+                print(f"Erreur lors de la copie de {file_name}: {e}")
+
+
 
 if __name__ == "__main__": # exécution du test de classification et affichage des résultats
     results = run_test()
+    sorted = export_per_scope(results)
     print("\nRÉSULTATS")
     for k, v in results.items(): # affichage du nom du fichier et du scope classifié pour chaque fichier testé
         print(k, ":", v)
