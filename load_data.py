@@ -57,58 +57,55 @@ def charger_tout_le_dossier(dir_path="."):
             log(f"Erreur lors du chargement de '{name}': {e}")
 
     # 2. PDF
-    pdf_paths = glob.glob(os.path.join(dir_path, "**", "*.pdf"), recursive=True) # chargement de tous les fichiers pdf du dossier courant et sous-dossiers
-    for path in pdf_paths: # boucle de chaque fichier pdf 
-        name = Path(path).name # report du nom par le nom du fichier pdf
+    pdf_paths = glob.glob(os.path.join(dir_path, "**", "*.pdf"), recursive=True)
+    for path in pdf_paths:
+        name = Path(path).name
         try:
             doc = pymupdf.open(path)
             full_text = ""
             for page in doc:
                 full_text += page.get_text("text")
             doc.close()
-            # gestion des tabulations existantes dans un fichier pdf
+            # Gestion des tabulations existantes dans un fichier pdf
             tables_regex = re.findall(r'(\d{2}/\d{2})\s+(\d{5,6})\s+([\d,]+\.?\d*)', full_text)
             data[name] = {"type": "pdf", "text": full_text, "tables_regex": tables_regex}
             log(f"PDF '{name}' chargé")
         except Exception as e:
             errors.append((name, str(e)))
             log(f"Erreur PDF '{name}'")
-            
-    # 3 . CSV
-    csv_paths = glob.glob(os.path.join(dir_path, "**", "*.csv"), recursive=True) # chargement de tous les fichiers csv du dossier courant
-    for path in csv_paths: # boucle de chaque fichier csv
-        name = Path(path).name # report du nom par le nom du fichier csv
+
+    # 3. CSV
+    csv_paths = glob.glob(os.path.join(dir_path, "**", "*.csv"), recursive=True)
+    for path in csv_paths:
+        name = Path(path).name
         try:
-            df = pd.read_csv(path) # lecture du fichier csv
-            data[name] = {"type": "csv", "dataframe": df} # report du nom de chaque feuille d'un fichier excel
+            df = pd.read_csv(path)
+            data[name] = {"type": "csv", "dataframe": df}
             log(f"CSV '{name}' chargé")
         except Exception as e:
             errors.append((name, str(e)))
             log(f"Erreur CSV '{name}'")
-    
 
     # 4. TXT
-    text_paths = glob.glob(os.path.join(dir_path, "**", "*.txt"), recursive=True) # chargement de tous les fichiers txt du dossier courant et sous-dossiers
-    for path in text_paths: # boucle de chaque fichier txt
-        name = Path(path).name # report du nom par le nom du fichier txt
+    text_paths = glob.glob(os.path.join(dir_path, "**", "*.txt"), recursive=True)
+    for path in text_paths:
+        name = Path(path).name
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f: # lecture du fichier txt, en ignorant les erreurs d'encodage
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
-            data[name] = {"type": "docx", "document": doc} # report du nom de chaque feuille d'un fichier excel
-            log(f"TXT '{name}' chargé") 
+            data[name] = {"type": "txt", "text": content} 
+            log(f"TXT '{name}' chargé")
         except Exception as e:
             errors.append((name, str(e)))
             log(f"Erreur TXT '{name}'")
 
-
-   # 5. DOCX
+    # 5. DOCX
     docx_paths = glob.glob(os.path.join(dir_path, "**", "*.docx"), recursive=True)
     for path in docx_paths:
         name = Path(path).name
         try:
-            from docx import Document
-            doc = Document(path) # Correction ici 
-            data[name] = {"type": "docx", "document": doc} 
+            doc = Document(path)
+            data[name] = {"type": "docx", "document": doc}
             log(f"DOCX '{name}' chargé")
         except Exception as e:
             errors.append((name, str(e)))
@@ -121,24 +118,20 @@ def charger_tout_le_dossier(dir_path="."):
         name = Path(path).name
         try:
             img = Image.open(path)
-            data[name] = {"type": "jpg", "image_object": img} 
+            data[name] = {"type": "jpg", "image_object": img}
             log(f"JPEG '{name}' chargé")
         except Exception as e:
             errors.append((name, str(e)))
             log(f"Erreur JPEG '{name}' : {e}")
-    
+
     log(f"{len(data)} fichiers chargés")
 
     return data, errors
 
 
-if __name__ == "__main__": # point d'entrée du programme
+if __name__ == "__main__":
     print("Chargement des fichiers ...")
-    data, errors = charger_tout_le_dossier(".") # chargement de tous les fichiers du dossier courant
-    print("\n Fichiers :", list(data.keys()))
+    data, errors = charger_tout_le_dossier(".")
+    print("\nFichiers :", list(data.keys()))
     if errors:
-        print("\ Erreurs :", [e[0] for e in errors])
-
-    
-    
-
+        print("\nErreurs :", [e[0] for e in errors])
