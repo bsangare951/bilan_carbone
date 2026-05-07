@@ -147,7 +147,7 @@ def export_per_scope(results, source_folder="cleaned_files"):
 
 if __name__ == "__main__": # exécution du test de classification et affichage des résultats
     results = run_test()
-    sorted = export_per_scope(results)
+    export_per_scope(results)
     print("\nRÉSULTATS")
     for k, v in results.items(): # affichage du nom du fichier et du scope classifié pour chaque fichier testé
         print(k, ":", v)
