@@ -5,8 +5,6 @@ import pandas as pd
 import pymupdf
 from PIL import Image
 from docx import Document
-import load_data
-import process_data
 
 model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2") # modèle léger et rapide pour les tests, à remplacer par un modèle plus puissant si besoin
 
