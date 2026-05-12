@@ -1,5 +1,5 @@
 import pandas as pd
-import numpy as np
+import time
 import os
 import requests
 import pickle
@@ -7,8 +7,9 @@ import unicodedata
 import warnings
 from dotenv import load_dotenv
 from rapidfuzz import fuzz, process
+import re
 
-# --- Configuration initiale ---
+
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 load_dotenv()
 
@@ -97,22 +98,20 @@ CORRESPONDANCES = {
     "pellets": "Granulés de bois (pellets)",
 
     # SCOPE 2 — Électricité / Chaleur
-    "electricite": "Éclairage 2023",  
-    "électricité": "Éclairage 2023",
-    "elec": "Éclairage 2023",
-    "courant": "Éclairage 2023",
-    "consommation edf": "Éclairage 2023",
-    "suivi consommation edf": "Éclairage 2023",
-    "compteur": "Éclairage 2023",
-    "relevé compteur": "Éclairage 2023",
-    "total kw/h": "Éclairage 2023",
-    "kwh": "Éclairage 2023",
-    "mwh": "Éclairage 2023",
+    "electricite": "mix electricité",
+    "électricité": "mix electricité",
+    "elec": "mix electricité",
+    "courant": "mix electricité",
+    "suivi consomation edf": "mix electricité",
+    "consommation edf": "mix electricité",
+    "compteur": "mix electricité",
+    "relevé compteur": "mix electricité",
+    "total kw/h": "mix electricité",
     "chauffage urbain": "Chaleur - réseau de chaleur urbain, France 2023",
     "reseau chaleur": "Chaleur - réseau de chaleur urbain, France 2023",
     "vapeur": "Chaleur - réseau de chaleur urbain, France 2023",
     "climatisation": "Climatisation 2023",  
-"   refroidissement": "Climatisation 2023",
+    "refroidissement": "Climatisation 2023",
 
 
     # SCOPE 3 — Déchets
@@ -120,10 +119,10 @@ CORRESPONDANCES = {
     "déchets": "Déchets ménagers et assimilés",
     "ordures menageres": "Déchets ménagers et assimilés",
     "om": "Déchets ménagers et assimilés",
-    "papier": "Papier carton",
+    "papier": "Papier",
     "papier carton": "Papier carton",
     "papier / carton": "Papier carton",
-    "carton": "Papier carton",
+    "carton": "Carton",
     "plastique": "Plastique",
     "verre": "Verre",
     "metal": "Métaux",
@@ -143,16 +142,16 @@ CORRESPONDANCES = {
     "btp": "Déchets du BTP",
 
     # SCOPE 3 — Fret / Transport
-    "transport": "Transport routier de marchandises",
+    "transport": "Articulé, 34 à 40 T, diesel routier, 7 de biodiesel",
     "fret": "Transport routier de marchandises",
-    "fret routier": "Transport routier de marchandises",
-    "camion": "Transport routier de marchandises",
-    "poids lourd": "Transport routier de marchandises",
-    "pl": "Transport routier de marchandises",
+    "fret routier": "Articulé, 34 à 40 T, diesel routier, 7 de biodiesel",
+    "camion": "Articulé, 34 à 40 T, diesel routier, 7 de biodiesel",
+    "poids lourd": "Articulé, 34 à 40 T, diesel routier, 7 de biodiesel",
+    "pl": "Articulé, 34 à 40 T, diesel routier, 7 de biodiesel",
     "vehicule utilitaire": "Véhicule utilitaire léger",
     "vul": "Véhicule utilitaire léger",
     "fret ferroviaire": "Transport ferroviaire de marchandises",
-    "train fret": "Transport ferroviaire de marchandises",
+    "train fret": "Train de marchandise",
     "fret maritime": "Transport maritime de marchandises",
     "bateau": "Transport maritime de marchandises",
     "fret aerien": "Transport aérien de marchandises",
@@ -179,7 +178,7 @@ CORRESPONDANCES = {
     "metro": "Métro",
     "rer": "RER",
     "tramway": "Tramway",
-    "train": "Train",
+    "train": "Train grande ligne",
     "tgv": "TGV",
     "intercites": "Intercités",
     "avion": "Avion court courrier",
@@ -324,6 +323,13 @@ def save_cache(cache):
 
 def local_search(designation, unite=None, threshold=80):
     designation_normalized = normalize_text(designation)
+    search_terms = [designation_normalized]
+
+    # Si la désignation contient une année, essayer aussi sans l'année
+    year_pattern = re.compile(r"\d{4} - ")
+    if year_pattern.search(designation):
+        base_designation = year_pattern.sub("", designation)
+        search_terms.append(normalize_text(base_designation))
 
     for sheet_name, df in loaded_sheets.items():
         if df is None:
@@ -333,27 +339,35 @@ def local_search(designation, unite=None, threshold=80):
             designation_normalized,
             df["search"],
             scorer=fuzz.token_set_ratio,
-            limit=1
+            limit=10
         )
 
         if matches:
-            first_element = matches[0][0]
+            valid_results = []
+            for match in matches:
+                if isinstance(match[0], str):
+                    _, score, idx = match
+                else:
+                    score, idx, _ = match
 
-            if isinstance(first_element, str):
-                _, score, idx = matches[0]
-            else:
-                score, idx, _ = matches[0]
+                if int(score) >= threshold:
+                    row = df.iloc[idx]
+                    if pd.isna(row["total non décomposé"]) or pd.isna(row["unité"]):
+                        continue
 
-            score = int(score)
+                    # Extraire l'année si présente
+                    nom = row["nom"]
+                    year_match = re.search(r"\d{4}", nom)
+                    year = int(year_match.group()) if year_match else 0
+                    valid_results.append((year, row, int(score)))
 
-            if score >= threshold:
-                row = df.iloc[idx]
+            if valid_results:
+                # Trier par année décroissante (priorité aux années récentes)
+                valid_results.sort(key=lambda x: x[0], reverse=True)
+                best_year, best_row, best_score = valid_results[0]
 
-                if pd.isna(row["total non décomposé"]) or pd.isna(row["unité"]):
-                    continue
-
-                valeur = row["total non décomposé"]
-                unite_row = row["unité"]
+                valeur = best_row["total non décomposé"]
+                unite_row = best_row["unité"]
 
                 if unite and pd.notna(unite_row):
                     try:
@@ -362,19 +376,18 @@ def local_search(designation, unite=None, threshold=80):
                     except ValueError:
                         pass
 
-                result = {
-                    "designation": row["nom"],
+                return {
+                    "designation": best_row["nom"],
                     "valeur": valeur,
                     "unite": unite_row,
-                    "source": row.get("source", ""),
-                    "localisation": row.get("localisation", ""),
+                    "source": best_row.get("source", ""),
+                    "localisation": best_row.get("localisation", ""),
+                    "incertitude": best_row.get("incertitude", ""),
                     "sheet": sheet_name,
-                    "score": score,
+                    "score": best_score
                 }
-                return result
 
     return None
-
 def api_search(designation, unite=None):
     key = f"{designation}_{unite}"
     if key in FE_CACHE:
@@ -387,6 +400,7 @@ def api_search(designation, unite=None):
     params = {"q": designation, "size": 5}
 
     try:
+        time.sleep(1)
         response = requests.get(url, headers=headers, params=params)
         response.raise_for_status()
         data = response.json()
@@ -413,34 +427,29 @@ def api_search(designation, unite=None):
         return None
 
 def get_facteurs(designation, unite=None):
-    """Récupère les facteurs d'émission en utilisant CORRESPONDANCES."""
     normalized_designation = normalize_designation(designation)
 
-    # 1. Essayer avec la désignation normalisée
+    # 1. Recherche locale avec priorité aux années récentes
     local_result = local_search(normalized_designation, unite)
     if local_result:
         return local_result
 
-    # 2. Essayer avec la désignation originale si différente
+    # 2. Recherche locale avec la désignation originale
     if normalized_designation != designation:
         local_result = local_search(designation, unite)
         if local_result:
             return local_result
 
-    # 3. Essayer l'API avec la désignation normalisée
+    # 3. Recherche API
     api_result = api_search(normalized_designation, unite)
     if api_result:
         return api_result
 
-    # 4. Fallback : API avec la désignation originale
     return api_search(designation, unite)
 
 SHEETS = ["FE Energie", "FE Fret", "FE Déchets", "FE Déplacements", "FE Intrants"]
 loaded_sheets = load_all_sheets(SHEETS)
 FE_CACHE = load_cache()
 
-print(get_facteurs("gaz", "kWh"))  
-print(get_facteurs("fioul", "L"))  
-print(get_facteurs("compteur", "kWh"))  
-print(get_facteurs("climatisation", "km"))  
-print(get_facteurs("carton", "t"))  
+
+print(get_facteurs("livraison"))  
