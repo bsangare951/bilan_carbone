@@ -450,6 +450,4 @@ def get_facteurs(designation, unite=None):
 SHEETS = ["FE Energie", "FE Fret", "FE Déchets", "FE Déplacements", "FE Intrants"]
 loaded_sheets = load_all_sheets(SHEETS)
 FE_CACHE = load_cache()
-
-
-print(get_facteurs("livraison"))  
+  

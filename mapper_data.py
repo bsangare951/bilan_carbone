@@ -5,6 +5,7 @@ import pandas as pd
 import pymupdf
 from PIL import Image
 from docx import Document
+import shutil
 
 model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2") # modèle léger et rapide pour les tests, à remplacer par un modèle plus puissant si besoin
 
@@ -119,7 +120,6 @@ def run_test(folder="cleaned_files"): # test de classification sur les fichiers 
 
     return results
 
-import shutil # Pour copier ou déplacer les fichiers
 
 def export_per_scope(results, source_folder="cleaned_files"):
     for file_name, scope in results.items():

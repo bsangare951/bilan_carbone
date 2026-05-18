@@ -11,7 +11,7 @@ import shutil
 datas, errors = ld.charger_tout_le_dossier(os.path.dirname(__file__) or ".")
 
 # Fichiers à exclure
-EXCLUDED_FILES = {"support_bc.xlsx", "export_bc.xlsx"}
+EXCLUDED_FILES = {"support_bc.xlsx", "export_bc.xlsx","Bilan_Carbone_V9.01"}
 
 def clean_excel(datas):
     cleaned_datas = {}
