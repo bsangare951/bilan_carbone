@@ -7,7 +7,7 @@ from PIL import Image
 from docx import Document
 import shutil
 
-model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2") # modèle léger et rapide pour les tests, à remplacer par un modèle plus puissant si besoin
+model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 
 # Les textes de référence pour chaque scope
 SCOPES = {
@@ -23,11 +23,14 @@ SCOPES = {
         "Énergie achetée refroidissement vapeur consommation électrique bâtiment."
     ),
     "SCOPE_3": (
-        "Transport de marchandises logistique sous-traitant prestataire livraison. "
-        "Gestion des déchets collecte tri recyclage valorisation tonnes kilogrammes. "
-        "Immobilisations achat matières premières fournisseur bilan carbone indirect. "
-        "Déplacements domicile travail déchets suivi tonnes transporteurs sites."
-    ),
+    "Transport de marchandises logistique sous-traitant prestataire livraison. "
+    "Gestion des déchets collecte tri recyclage valorisation tonnes kilogrammes. "
+    "Immobilisations achat matières premières fournisseur bilan carbone indirect. "
+    "Déplacements domicile travail déchets suivi tonnes transporteurs sites. "
+    "Kilométrage véhicule suivi KM annuel parc automobile distance parcourue. "
+    "Véhicule société déplacement professionnel indemnité kilométrique trajet. "
+    "Flotte automobile kilomètres parcourus conducteur total annuel mensuel."
+    )
 }
 
 def cosine_similarity(a, b): # calcul de la similarité cosinus entre deux vecteurs
