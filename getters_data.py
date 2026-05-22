@@ -120,8 +120,7 @@ CORRESPONDANCES = {
     "ordures menageres": "Déchets ménagers et assimilés",
     "om": "Déchets ménagers et assimilés",
     "papier": "Papier",
-    "papier carton": "Papier carton",
-    "papier / carton": "Papier carton",
+    "papier carton": "Papier et carton ",
     "carton": "Carton",
     "plastique": "Plastique",
     "verre": "Verre",
@@ -387,6 +386,14 @@ def local_search(designation, unite=None, threshold=80):
 
                 valeur = best_row["total non décomposé"]
                 unite_row = best_row["unité"]
+                
+                nom_normalized = normalize_text(best_row["nom"])
+                if ("papier" in nom_normalized or "carton" in nom_normalized):
+                    unite_lower = unite_row.lower()
+                    if ("/t" in unite_lower or "tonne" in unite_lower or "/tonne" in unite_lower) and valeur > 100:
+                        valeur = valeur / 1000
+                        unite_row = "kgCO₂e/kg"
+                        print(f"    [FIX] Papier/Carton converti : {valeur} {unite_row}")
 
                 if unite and pd.notna(unite_row):
                     try:
