@@ -204,7 +204,6 @@ FORMAT DE REPONSE - REGLES ABSOLUES :
 
 
 def get_groq_client():
-    """Retourne le client Groq, en le creant si necessaire."""
     global _groq_client
     if not _groq_client:
         _groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -212,10 +211,6 @@ def get_groq_client():
 
 
 def appel_groq_securise(prompt):
-    """
-    Appelle l'API Groq avec gestion automatique des limites.
-    Gere les quotas par minute et par jour pour eviter les erreurs 429.
-    """
     global _req_minute, _req_jour, _derniere_minute
 
     # Reinitialiser le compteur minute si necessaire
@@ -256,7 +251,6 @@ def appel_groq_securise(prompt):
 
 
 def extract_numeric(value):
-    """Extrait une valeur numerique d'une cellule, gere les formats francais."""
     if pd.isna(value):
         return None
     try:
@@ -272,10 +266,6 @@ def extract_numeric(value):
 
 
 def colonne_est_utile(col_name):
-    """
-    Determine si une colonne peut contenir des donnees carbone.
-    Protege les colonnes d'energie et de consommation.
-    """
     col_norm = gd.normalize_text(str(col_name))
     
     # Toujours garder les colonnes liees a l'energie ou aux matieres
@@ -293,7 +283,6 @@ def colonne_est_utile(col_name):
 
 
 def est_ligne_total(row):
-    """Verifie si une ligne contient un mot-cle indiquant un total."""
     for val in row.values:
         if any(mot in gd.normalize_text(str(val)) for mot in MOTS_TOTAL):
             return True
@@ -301,13 +290,11 @@ def est_ligne_total(row):
 
 
 def est_fichier_copies(filename):
-    """Detecte si le fichier est un suivi de copies/impressions."""
     filename_norm = gd.normalize_text(filename)
     return any(mot in filename_norm for mot in FICHIERS_NON_CARBONE)
 
 
 def smart_header(df_raw):
-    """Detecte automatiquement la ligne d'en-tete dans un fichier brut."""
     mots_cles = [
         "quantite", "qte", "volume", "consommation", "total", "unite",
         "designation", "libelle", "nom", "nature", "description",
@@ -340,7 +327,6 @@ def smart_header(df_raw):
 
 
 def load_txt_as_df(filepath):
-    """Charge un fichier TXT et le convertit en DataFrame."""
     with open(filepath, 'r', encoding='utf-8') as f:
         lignes = f.readlines()
     
@@ -353,7 +339,6 @@ def load_txt_as_df(filepath):
 
 
 def load_file(filepath):
-    """Charge un fichier selon son extension (CSV, Excel, TXT)."""
     ext = os.path.splitext(filepath)[1].lower()
     
     try:
@@ -380,11 +365,6 @@ def load_file(filepath):
 
 
 def preparer_contexte(df, filename, scope):
-    """
-    Prepare les donnees avant envoi a Groq.
-    - Fichiers texte : envoie le texte brut
-    - Fichiers structures : filtre les colonnes inutiles et priorise les totaux
-    """
     # Cas d'un fichier texte (une seule colonne "contenu")
     if list(df.columns) == ["contenu"]:
         texte = "\n".join(df["contenu"].astype(str).tolist())
@@ -447,7 +427,6 @@ def preparer_contexte(df, filename, scope):
 
 
 def get_annee_cible():
-    """Determine l'exercice comptable en cours."""
     annee = datetime.now().year
     mois = datetime.now().month
     if mois >= 10:
@@ -458,10 +437,6 @@ ANNEE_CIBLE = get_annee_cible()
 
 
 def extraire_avec_groq(filepath, scope):
-    """
-    Extrait les donnees carbone d'un fichier via l'API Groq.
-    Retourne une liste de dictionnaires normalises.
-    """
     filename = os.path.basename(filepath)
     
     # Ignorer les fichiers de copies/impressions
@@ -484,15 +459,15 @@ def extraire_avec_groq(filepath, scope):
 
     # Construire le prompt
     prompt = f"""FICHIER : {filename}
-SCOPE GHG : {scope}
-EXERCICE CIBLE : {ANNEE_CIBLE}
-INSTRUCTION : {contexte_type}
+    SCOPE GHG : {scope}
+    EXERCICE CIBLE : {ANNEE_CIBLE}
+    INSTRUCTION : {contexte_type}
 
-DONNEES BRUTES :
-{contexte_str}
+    DONNEES BRUTES :
+    {contexte_str}
 
-Applique le protocole d'extraction defini dans tes instructions systeme.
-Retourne les donnees CO2 de ce fichier au format JSON."""
+    Applique le protocole d'extraction defini dans tes instructions systeme.
+    Retourne les donnees CO2 de ce fichier au format JSON."""
 
     # Appeler Groq
     reponse = appel_groq_securise(prompt)
@@ -552,7 +527,7 @@ Retourne les donnees CO2 de ce fichier au format JSON."""
             designation = gd.CORRESPONDANCES.get(
                 gd.normalize_text(designation_brute), designation_brute)
 
-            # Agregation par cle (designation + unite)
+            # Agregation par cle
             cle = (designation, unite.lower())
             if cle in agregat:
                 agregat[cle]["quantite"] += float(qte)
@@ -584,10 +559,6 @@ Retourne les donnees CO2 de ce fichier au format JSON."""
 
 
 def lancer_le_bilan(base_path="."):
-    """
-    Fonction principale qui parcourt les dossiers, extrait les donnees
-    et retourne une liste de resultats normalises.
-    """
     final_data = []
     non_traites = []
 
