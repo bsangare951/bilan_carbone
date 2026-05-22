@@ -677,18 +677,3 @@ def lancer_le_bilan(base_path="."):
 
     print(f"\n{'='*70}")
     return dedup
-
-if __name__ == "__main__":
-    data = lancer_le_bilan()
-    
-    print(f"\n{'FICHIER':<35} | {'DESIGNATION':<28} | {'QUANTITE':>10} | {'UNITE':<10} | {'FIABILITE':<8} | SCOPE")
-    print("-" * 115)
-    for d in data:
-        print(
-            f"{d['source'][:35]:<35} | "
-            f"{d['designation'][:28]:<28} | "
-            f"{d['quantite']:>10.2f} | "
-            f"{d['unite']:<10} | "
-            f"{d['fiabilite']:<8} | "
-            f"{d['scope']}"
-        )
