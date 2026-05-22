@@ -362,8 +362,27 @@ def local_search(designation, unite=None, threshold=80):
                     valid_results.append((year, row, int(score)))
 
             if valid_results:
-                # Trier par année décroissante (priorité aux années récentes)
-                valid_results.sort(key=lambda x: x[0], reverse=True)
+                def score_compatibilite(item):
+                        year, row, score = item
+                        unite_fe = str(row.get("unité", "")).lower()
+                        
+                        # Bonus si l'unité du FE est compatible avec l'unité demandée
+                        unite_demandee = (unite or "").lower()
+                        compatible = 0
+                        if unite_demandee == "l" and "litre" in unite_fe:
+                            compatible = 1000
+                        elif unite_demandee == "kg" and unite_fe.endswith("/kg"):
+                            compatible = 1000
+                        elif unite_demandee == "t" and unite_fe.endswith("/t"):
+                            compatible = 1000
+                        elif unite_demandee == "kwh" and "kwh" in unite_fe and "gj" not in unite_fe:
+                            compatible = 1000
+                        elif unite_demandee == "km" and unite_fe.endswith("/km"):
+                            compatible = 1000
+                        
+                        return (compatible, year, score)
+
+                valid_results.sort(key=score_compatibilite, reverse=True)
                 best_year, best_row, best_score = valid_results[0]
 
                 valeur = best_row["total non décomposé"]
