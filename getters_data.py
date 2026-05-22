@@ -252,7 +252,6 @@ def normalize_text(text):
     return text
 
 def normalize_designation(designation):
-    """Normalise une désignation en utilisant CORRESPONDANCES."""
     designation_lower = designation.lower()
     return CORRESPONDANCES.get(designation_lower, designation)
 
@@ -386,7 +385,7 @@ def local_search(designation, unite=None, threshold=80):
 
                 valeur = best_row["total non décomposé"]
                 unite_row = best_row["unité"]
-                
+
                 nom_normalized = normalize_text(best_row["nom"])
                 if ("papier" in nom_normalized or "carton" in nom_normalized):
                     unite_lower = unite_row.lower()
