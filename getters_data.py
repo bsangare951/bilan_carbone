@@ -115,9 +115,11 @@ CORRESPONDANCES = {
 
 
     # SCOPE 3 — Déchets
-    "dechets": "Déchets ménagers et assimilés",
-    "déchets": "Déchets ménagers et assimilés",
-    "ordures menageres": "Déchets ménagers et assimilés",
+    "dechets ménagers et assimilés": "DIS (Déchets Industriels Spéciaux) - Stockage - Impacts",
+    "dechets menagers": "DIS (Déchets Industriels Spéciaux) - Stockage - Impacts",
+    "déchets": "DIS (Déchets Industriels Spéciaux) - Stockage - Impacts",
+    "dechets": "DIS (Déchets Industriels Spéciaux) - Stockage - Impacts",
+    "ordures menageres": "DIS (Déchets Industriels Spéciaux) - Stockage - Impacts",
     "om": "Déchets ménagers et assimilés",
     "papier": "Papier",
     "papier carton": "Papier et carton ",
@@ -161,10 +163,11 @@ CORRESPONDANCES = {
     "transporteur": "Transport routier de marchandises",
 
     # SCOPE 3 — Déplacements
-    "deplacement": "Voiture particulière",
-    "déplacement": "Voiture particulière",
-    "voiture": "Voiture particulière",
-    "vehicule": "Voiture particulière",
+    "voiture particuliere":      "Voiture - motorisation moyenne - 2018",
+    "voiture":                   "Voiture - motorisation moyenne - 2018",
+    "indemnites kilometriques":  "Voiture - motorisation moyenne - 2018",
+    "indemnites km":             "Voiture - motorisation moyenne - 2018",
+    "deplacement voiture":       "Voiture - motorisation moyenne - 2018",
     "vp": "Voiture particulière",
     "voiture diesel": "Voiture particulière, diesel",
     "voiture essence": "Voiture particulière, essence",

@@ -2,16 +2,49 @@ import getters_data as gd
 import extract_files_data as ev
 import os
 from collections import defaultdict
+import pickle
 
 # Unités qui signifient que l'émission est déjà calculée
 UNITES_DEJA_CALCULEES = ["kgco2e", "tco2e", "kgco2", "co2e"]
 
-# Facteurs de conversion tCO2e
+# Mots clés pour ignorer les lignes total (double comptage)
+MOTS_TOTAL_DESIG = ["total", "sous-total", "cumul", "somme"]
+
+# Facteur de conversion
 KG_TO_T = 0.001
 
 
+def convertir_facteur_si_necessaire(valeur_fe, unite_fe, unite_quantite):
+
+    unite_fe_norm = unite_fe.lower().replace(" ", "")
+    unite_q_norm  = unite_quantite.lower().strip()
+
+    # FE en /tonne mais quantité en kg
+    if any(u in unite_fe_norm for u in ["/t", "/tonne", "/tonnes"]) \
+       and unite_q_norm == "kg":
+        return valeur_fe / 1000, f"{unite_fe} (converti /kg)"
+
+    # FE en /kg mais quantité en tonne
+    if "/kg" in unite_fe_norm and unite_q_norm in ["t", "tonne", "tonnes"]:
+        return valeur_fe * 1000, f"{unite_fe} (converti /t)"
+
+    # FE en /MWh mais quantité en kWh
+    if "/mwh" in unite_fe_norm and unite_q_norm == "kwh":
+        return valeur_fe / 1000, f"{unite_fe} (converti /kWh)"
+
+    # FE en /kWh mais quantité en MWh
+    if "/kwh" in unite_fe_norm and unite_q_norm == "mwh":
+        return valeur_fe * 1000, f"{unite_fe} (converti /MWh)"
+
+    # FE en /km mais quantité en t.km → incompatible, on signale
+    if "/km" in unite_fe_norm and unite_q_norm == "t.km":
+        return None, "incompatible"
+
+    return valeur_fe, unite_fe
+
+
 def calculer_emissions(data_extraite):
-    resultats = []
+    resultats    = []
     non_calcules = []
 
     for entry in data_extraite:
@@ -22,7 +55,11 @@ def calculer_emissions(data_extraite):
         source      = entry.get("source", "")
         fiabilite   = entry.get("fiabilite", "faible")
 
-        # CAS 1 : émissions déjà calculées
+        desig_norm = gd.normalize_text(designation)
+        if any(m in desig_norm for m in MOTS_TOTAL_DESIG):
+            print(f"  [SKIP] Total ignore : {designation}")
+            continue
+
         if unite.lower().replace(" ", "") in UNITES_DEJA_CALCULEES:
             emissions_kg = quantite
             resultats.append({
@@ -37,24 +74,23 @@ def calculer_emissions(data_extraite):
                 "emissions_tCO2e":  round(emissions_kg * KG_TO_T, 6),
                 "incertitude":      entry.get("incertitude", 0),
                 "fiabilite":        fiabilite,
-                "source_facteur":   "déjà calculé"
+                "source_facteur":   "deja calcule"
             })
-            print(f"  [OK] {designation[:40]} → {emissions_kg:.2f} kgCO2e (déjà calculé)")
+            print(f"  [OK] {designation[:40]} -> {emissions_kg:.2f} kgCO2e (deja calcule)")
             continue
 
-        # CAS 2
         print(f"  [FE] Recherche facteur pour '{designation}' ({unite})...")
         facteur = gd.get_facteurs(designation, unite)
 
         if facteur is None or facteur.get("valeur") is None:
-            print(f"Facteur introuvable : {designation} ({unite})")
+            print(f"  [ERREUR] Facteur introuvable : {designation} ({unite})")
             non_calcules.append({
                 "source":      source,
                 "scope":       scope,
                 "designation": designation,
                 "quantite":    quantite,
                 "unite":       unite,
-                "raison":      "Facteur d'émission introuvable"
+                "raison":      "Facteur d emission introuvable"
             })
             continue
 
@@ -63,21 +99,47 @@ def calculer_emissions(data_extraite):
         incertitude = facteur.get("incertitude", 0)
         source_fe   = facteur.get("source", "Base Carbone ADEME")
 
-        if not valeur_fe or valeur_fe <= 0:
-            print(f"Facteur nul ou invalide : {designation}")
+        if ("diesel" in designation.lower() or "gazole" in designation.lower()) and unite == "L":
+            if valeur_fe < 1:
+                print(f"    [CONV DIESEL] Facteur erroné {valeur_fe} {unite_fe} -> remplacement par 2.41 kgCO2e/L")
+                valeur_fe = 2.41
+                unite_fe = "kgCO2e/L"
+
+        if ("papier" in designation.lower() or "carton" in designation.lower()) and unite == "kg":
+            if valeur_fe > 100:
+                print(f"    [CONV] Papier/Carton : {valeur_fe} {unite_fe} -> /1000")
+                valeur_fe = valeur_fe / 1000
+                unite_fe = "kgCO2e/kg"
+
+        if valeur_fe is None or valeur_fe <= 0:
+            print(f"  [ERREUR] Facteur invalide ({valeur_fe}) pour : {designation}")
             non_calcules.append({
                 "source":      source,
                 "scope":       scope,
                 "designation": designation,
                 "quantite":    quantite,
                 "unite":       unite,
-                "raison":      f"Facteur nul : {valeur_fe}"
+                "raison":      f"Facteur negatif ou nul : {valeur_fe}"
             })
             continue
 
-        # CAS 3
-        emissions_kg = quantite * valeur_fe
-        print(f"  [OK] {designation[:35]} → {quantite} {unite} × {valeur_fe} = {emissions_kg:.2f} kgCO2e")
+        valeur_fe_conv, unite_fe_conv = convertir_facteur_si_necessaire(valeur_fe, unite_fe, unite)
+
+        if valeur_fe_conv is None:
+            print(f"  [ERREUR] Unite incompatible : {unite_fe} vs {unite} pour {designation}")
+            non_calcules.append({
+                "source":      source,
+                "scope":       scope,
+                "designation": designation,
+                "quantite":    quantite,
+                "unite":       unite,
+                "raison":      f"Unite incompatible : FE={unite_fe}, quantite={unite}"
+            })
+            continue
+
+        emissions_kg = quantite * valeur_fe_conv
+        print(f"  [OK] {designation[:35]} -> {quantite} {unite} x "
+              f"{valeur_fe_conv:.4f} = {emissions_kg:.2f} kgCO2e")
 
         resultats.append({
             "source":           source,
@@ -85,8 +147,8 @@ def calculer_emissions(data_extraite):
             "designation":      designation,
             "quantite":         quantite,
             "unite":            unite,
-            "facteur_emission": valeur_fe,
-            "unite_facteur":    unite_fe,
+            "facteur_emission": valeur_fe_conv,
+            "unite_facteur":    unite_fe_conv,
             "emissions_kgCO2e": round(emissions_kg, 4),
             "emissions_tCO2e":  round(emissions_kg * KG_TO_T, 6),
             "incertitude":      incertitude,
@@ -96,15 +158,7 @@ def calculer_emissions(data_extraite):
 
     return resultats, non_calcules
 
-
 def agreger_par_scope(resultats):
-    """
-    Agrège les émissions par scope et calcule :
-    - Total kgCO2e par scope
-    - Total tCO2e par scope
-    - Incertitude moyenne pondérée
-    - Total général
-    """
     agregat = defaultdict(lambda: {
         "emissions_kgCO2e": 0.0,
         "emissions_tCO2e":  0.0,
@@ -125,8 +179,7 @@ def agreger_par_scope(resultats):
                 pass
         agregat[scope]["details"].append(r)
 
-    # Calcul incertitude moyenne par scope
-    bilan = {}
+    bilan    = {}
     total_kg = 0.0
     for scope, data in sorted(agregat.items()):
         incert_moy = (sum(data["incertitudes"]) / len(data["incertitudes"])
@@ -144,17 +197,10 @@ def agreger_par_scope(resultats):
         "emissions_kgCO2e": round(total_kg, 4),
         "emissions_tCO2e":  round(total_kg * KG_TO_T, 6),
     }
-
     return bilan
 
 
 def calculer_incertitude_bilan(bilan, data_extraite, fichiers_attendus=None):
-    """
-    Calcule le taux d'incertitude global du bilan :
-    - Incertitude des facteurs d'émission (ADEME)
-    - Incertitude liée aux fichiers manquants
-    """
-    # Incertitude facteurs
     toutes_incertitudes = []
     for scope, data in bilan.items():
         if scope == "TOTAL":
@@ -167,9 +213,8 @@ def calculer_incertitude_bilan(bilan, data_extraite, fichiers_attendus=None):
     incert_facteurs = (sum(toutes_incertitudes) / len(toutes_incertitudes)
                        if toutes_incertitudes else 0)
 
-    # Incertitude fichiers manquants
     if fichiers_attendus:
-        nb_presents  = len(set(d["source"] for d in data_extraite))
+        nb_presents     = len(set(d["source"] for d in data_extraite))
         taux_completude = min(nb_presents / fichiers_attendus, 1.0)
         incert_fichiers = (1 - taux_completude) * 100
     else:
@@ -178,12 +223,12 @@ def calculer_incertitude_bilan(bilan, data_extraite, fichiers_attendus=None):
     incertitude_globale = round((incert_facteurs + incert_fichiers) / 2, 2)
 
     return {
-        "incertitude_facteurs_%":  round(incert_facteurs, 2),
-        "incertitude_fichiers_%":  round(incert_fichiers, 2),
-        "incertitude_globale_%":   incertitude_globale,
-        "niveau_confiance":        "haute" if incertitude_globale < 20
-                                   else "moyenne" if incertitude_globale < 40
-                                   else "faible"
+        "incertitude_facteurs_%": round(incert_facteurs, 2),
+        "incertitude_fichiers_%": round(incert_fichiers, 2),
+        "incertitude_globale_%":  incertitude_globale,
+        "niveau_confiance":       "haute"   if incertitude_globale < 20
+                                  else "moyenne" if incertitude_globale < 40
+                                  else "faible"
     }
 
 
@@ -201,7 +246,8 @@ def afficher_bilan(bilan, incertitude):
         for d in data.get("details", []):
             print(f"    {d['designation'][:35]:<35} "
                   f"{d['emissions_tCO2e']:>10.4f} tCO2e")
-        print(f"  {'SOUS-TOTAL':>40} : {data['emissions_tCO2e']:>10.4f} tCO2e")
+        print(f"  {'SOUS-TOTAL':>40} : "
+              f"{data['emissions_tCO2e']:>10.4f} tCO2e")
 
     print("\n" + "═" * 65)
     print(f"  TOTAL GÉNÉRAL : {bilan['TOTAL']['emissions_tCO2e']:.4f} tCO2e")
@@ -216,6 +262,11 @@ def afficher_bilan(bilan, incertitude):
 
 
 if __name__ == "__main__":
+    # Supprimer le cache pour forcer un recalcul des facteurs
+    if os.path.exists("cache_fe.pkl"):
+        os.remove("cache_fe.pkl")
+        print("[CACHE] cache_fe.pkl supprimé — recalcul des facteurs")
+
     print("Extraction des données...")
     data_extraite = ev.lancer_le_bilan()
 
@@ -230,7 +281,7 @@ if __name__ == "__main__":
         for nc in non_calcules:
             print(f"  - {nc['designation']} ({nc['unite']}) : {nc['raison']}")
 
-    bilan      = agreger_par_scope(resultats)
+    bilan       = agreger_par_scope(resultats)
     incertitude = calculer_incertitude_bilan(bilan, data_extraite)
 
     afficher_bilan(bilan, incertitude)
