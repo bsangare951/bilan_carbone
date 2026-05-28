@@ -7,11 +7,23 @@ import re
 import csv
 import shutil
 
-# Chargement de tous les fichiers
-datas, errors = ld.charger_tout_le_dossier(os.path.dirname(__file__) or ".")
 
 # Fichiers à exclure
 EXCLUDED_FILES = {"support_bc.xlsx", "export_bc.xlsx","Bilan_Carbone_V9.01.xlsx"}
+
+
+def charger_et_nettoyer(dossier_source):
+    print(f"[INFO] Chargement depuis : {dossier_source}")
+    datas, errors = ld.charger_tout_le_dossier(dossier_source)
+    
+    cleaned = clean_excel(datas)
+    cleaned = clean_PDF(cleaned)
+    cleaned = clean_CSV(cleaned)
+    cleaned = clean_DOCX(cleaned)
+    cleaned = clean_JPEG(cleaned)
+    
+    return cleaned, errors
+
 
 def clean_excel(datas):
     cleaned_datas = {}
@@ -238,9 +250,3 @@ def clean_JPEG(datas):
 
     return datas
 
-
-test = clean_excel(datas)
-test2 = clean_PDF(test)
-test3 = clean_CSV(test2)
-test4 = clean_DOCX(test3)
-test5 = clean_JPEG(test4)

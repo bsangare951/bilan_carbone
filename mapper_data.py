@@ -16,11 +16,13 @@ SCOPES = {
         "Consommation de gaz naturel fioul propane butane charbon biomasse. "
         "Émissions directes combustion station service plein litres. "
         "Flotte véhicules entreprise carburant fossile."
+        "Trajets carburant essence diesel kerosene"
     ),
     "SCOPE_2": (
         "Facture d'électricité EDF fournisseur d'énergie consommation kWh MWh. "
         "Abonnement électrique compteur relevé de compteur chauffage urbain. "
         "Énergie achetée refroidissement vapeur consommation électrique bâtiment."
+        "Suivi consommation facture EDF électricité "
     ),
     "SCOPE_3": (
     "Transport de marchandises logistique sous-traitant prestataire livraison. "
@@ -124,31 +126,25 @@ def run_test(folder="cleaned_files"): # test de classification sur les fichiers 
     return results
 
 
-def export_per_scope(results, source_folder="cleaned_files"):
+def export_per_scope(results, source_folder="cleaned_files", dest_base="."):
     for file_name, scope in results.items():
-        # Si le fichier est utile (SCOPE_1, 2 ou 3)
         if scope in ["SCOPE_1", "SCOPE_2", "SCOPE_3"]:
-            
-            # Créer le dossier du scope s'il n'existe pas
-            if not os.path.exists(scope):
-                os.makedirs(scope)
-            
-            # chemins source et destination
+            scope_dir = os.path.join(dest_base, scope)  
+            if not os.path.exists(scope_dir):
+                os.makedirs(scope_dir)
             src_path = os.path.join(source_folder, file_name)
-            dst_path = os.path.join(scope, file_name)
-            
-            # Copier le fichier dans le bon dossier
+            dst_path = os.path.join(scope_dir, file_name)
             try:
                 shutil.copy(src_path, dst_path)
-                print(f"Copié : {file_name} -> {scope}/")
+                print(f"Copié : {file_name} -> {scope_dir}/")
             except Exception as e:
                 print(f"Erreur lors de la copie de {file_name}: {e}")
 
 
 
-if __name__ == "__main__": # exécution du test de classification et affichage des résultats
+if __name__ == "__main__":
     results = run_test()
     export_per_scope(results)
     print("\nRÉSULTATS")
-    for k, v in results.items(): # affichage du nom du fichier et du scope classifié pour chaque fichier testé
+    for k, v in results.items():
         print(k, ":", v)
