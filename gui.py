@@ -8,12 +8,13 @@ from datetime import datetime
 from PIL import Image, ImageTk
 import io
 from contextlib import redirect_stdout
-
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from process_data import charger_et_nettoyer
 from mapper_data import run_test, export_per_scope
 from extract_files_data import lancer_le_bilan
 from calcul_data import calculer_emissions, agreger_par_scope, afficher_bilan, calculer_incertitude_bilan
+
+
 
 
 class BilanCarboneGUI:
@@ -65,8 +66,8 @@ class BilanCarboneGUI:
     def setup_ui(self):
         T = self.TRANSP
 
-        self.main = tk.Frame(self.root, bg=T)
-        self.main.place(relx=0.5, rely=0.5, anchor="n", width=1000, height=300)
+        self.main = tk.Frame(self.root, bg="#495899")
+        self.main.place(relx=0.5, rely=0.5, anchor="center", width=1000, height=600)
 
         tk.Label(self.main, text="🌿  Bilan Carbone Automatisé",
                  font=("Arial", 22, "bold"), bg="#6841FF", fg="white",
@@ -77,7 +78,7 @@ class BilanCarboneGUI:
                  font=("Arial", 10, "italic"), bg="#971515",
                  fg="#dfe6e9").pack(pady=(0, 15))
 
-        btn_frame = tk.Frame(self.main, bg=T)
+        btn_frame = tk.Frame(self.main, bg="#000874")
         btn_frame.pack(pady=5)
 
         btn_cfg = {"width": 26, "height": 2, "font": ("Arial", 10, "bold"),
@@ -108,7 +109,7 @@ class BilanCarboneGUI:
 
         self.label_dossier = tk.Label(self.main,
                                       text="Aucun dossier sélectionné",
-                                      font=("Arial", 9), bg=T, fg="#bdc3c7")
+                                      font=("Arial", 9), bg="#942328", fg="white")
         self.label_dossier.pack(pady=(5, 2))
 
         log_outer = tk.Frame(self.main, bg="white", bd=1, relief="solid")
@@ -116,11 +117,11 @@ class BilanCarboneGUI:
 
         tk.Label(log_outer, text="Journal d'exécution",
                  font=("Arial", 9, "bold"), bg="white",
-                 fg="#636e72").pack(fill=tk.X, padx=8, pady=(5, 0))
+                 fg="white").pack(fill=tk.X, padx=8, pady=(5, 0))
 
         self.log_text = scrolledtext.ScrolledText(
             log_outer, width=110, height=16, font=("Courier", 9),
-            bg="#f8f9fa", fg="#2d3436", relief="flat", bd=0)
+            bg="#f8f9fa", fg="#000000", relief="flat", bd=0)
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
 
         res_frame = tk.Frame(self.main, bg="white", bd=1, relief="solid")
@@ -137,7 +138,7 @@ class BilanCarboneGUI:
 
         tk.Label(self.main,
                  text=f"© {datetime.now().year}  HDQUALITE — Outil Bilan Carbone",
-                 font=("Arial", 8), bg=T, fg="#b2bec3").pack(pady=(5, 0))
+                 font=("Arial", 8), bg="#942238", fg="white").pack(pady=(5, 0))
 
     # LOGS
 
@@ -238,7 +239,7 @@ class BilanCarboneGUI:
                 t0 = time.time()
 
                 self.log("Extraction des données en cours...", "INFO")
-                self.data_extraite = lancer_le_bilan(base_path=self.dossier_source)
+                self.data_extraite, _ = lancer_le_bilan(base_path=self.dossier_source)
                 self.log(f"{len(self.data_extraite)} valeur(s) extraite(s)", "SUCCESS")
 
                 self.log("Calcul des émissions CO₂...", "INFO")
