@@ -16,7 +16,6 @@ from calcul_data import calculer_emissions, agreger_par_scope, afficher_bilan, c
 
 
 
-
 class BilanCarboneGUI:
     def __init__(self):
         self.root = tk.Tk()
@@ -239,13 +238,24 @@ class BilanCarboneGUI:
                 t0 = time.time()
 
                 self.log("Extraction des données en cours...", "INFO")
-                self.data_extraite, _ = lancer_le_bilan(base_path=self.dossier_source)
+
+                extraction_retour = lancer_le_bilan(base_path=self.dossier_source)
+                if isinstance(extraction_retour, tuple):
+                    self.data_extraite, nb_fichiers = extraction_retour
+                else:
+                    self.data_extraite = extraction_retour
+                    nb_fichiers = None
+
                 self.log(f"{len(self.data_extraite)} valeur(s) extraite(s)", "SUCCESS")
 
                 self.log("Calcul des émissions CO₂...", "INFO")
                 self.resultats, non_calc = calculer_emissions(self.data_extraite)
                 self.bilan = agreger_par_scope(self.resultats)
-                incertitude = calculer_incertitude_bilan(self.bilan, self.data_extraite)
+                incertitude = calculer_incertitude_bilan(
+                    self.bilan,
+                    self.data_extraite,
+                    fichiers_attendus=nb_fichiers,
+                )
                 duree = time.time() - t0
 
                 tampon = io.StringIO()

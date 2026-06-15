@@ -1,795 +1,986 @@
-import getters_data as gd
+from __future__ import annotations
+
+import csv
+import json
 import os
 import re
-import json
-import time
+import unicodedata
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
 import pandas as pd
-from datetime import datetime
-from groq import Groq
-from dotenv import load_dotenv
 
-load_dotenv()
+VERSION = "BILAN CARBONE — Extraction V21 ACHATS CONSÉQUENTS"
 
-# ---------------------------------------------------------------------------
-# CONSTANTES
-# ---------------------------------------------------------------------------
-
-UNITES_VALIDES = {
-    "L":      ["l", "litres", "litre"],
-    "m³":     ["m3", "m³"],
-    "kg":     ["kg", "kilogrammes"],
-    "t":      ["t", "tonnes", "tonne"],
-    "kWh":    ["kwh", "kilowatt-heure", "kilowattheure"],
-    "MWh":    ["mwh", "megawatt-heure"],
-    "t.km":   ["t.km", "tonnes.km", "tonnes-km", "tonne.km", "tkm"],
-    "km":     ["km", "kilometres", "kilometre"],
-    "kgCO2e": ["kgco2e", "kg co2e", "kgco2"],
-}
-
-# Index inversé pré-calculé : alias normalisé -> unité canonique
-_UNITE_LOOKUP: dict[str, str] = {}
-for _canon, _aliases in UNITES_VALIDES.items():
-    _UNITE_LOOKUP[gd.normalize_text(_canon)] = _canon
-    for _a in _aliases:
-        _UNITE_LOOKUP[gd.normalize_text(_a)] = _canon
-
-COLONNES_IGNOREES = frozenset([
-    "€", "eur", "euros", "m€", "k€", "etp", "%", "taux", "ratio",
-    "date", "ref", "reference", "commentaire", "note", "observation",
-    "fournisseur", "adresse", "siren", "siret", "prenom",
-    "cout", "coût", "prix", "tarif", "montant", "tva", "ht", "ttc",
-])
-
-FICHIERS_EXCLUS = frozenset([
-    "synthese", "bilan_carbone", "ratios", "utilitaires",
-    "matrice", "descriptif", "soc_", "rgpd",
-    "analyse env", "analyse_env", ".~lock", "~$",
-    "_in",  # doublons de relevés compteurs
-    # Note : "liste", "export", "recap" retirés car peuvent contenir
-    # des données carbone exploitables (conso véhicules, données utilisées...)
-])
-
-MOTS_TOTAL_RE = re.compile(
-    r"\b(total|sous-total|cumul|somme|total kgs|total annuel)\b"
-)
-
-FICHIERS_NON_CARBONE = frozenset(["copies", "impression", "imprimante"])
-
-# Mots-clés indiquant un suivi kilométrique de flotte de véhicules légers
-# -> la désignation doit être forcée à "Voiture - motorisation moyenne - 2018"
-MOTS_FLOTTE_VEHICULES = frozenset([
-    "km annuel", "km par vehicule", "kilometrage", "odometre",
-    "conducteur", "suivi km", "releve km", "flotte",
-])
-
-# Mots-clés dans le contenu texte indiquant des relevés odomètre
-MOTS_CONTENU_FLOTTE = frozenset([
-    "conducteur", "n° int", "totaux", "remplacement",
-    "total annuel", "total mensuel",
-])
-
-UNITES_INVALIDES = frozenset([
-    "kw", "w", "mw", "l/100", "l/100km",
-    "copies", "pages", "nombre", "nb", "impressions",
-])
-
-COLONNES_UTILES_KW = frozenset([
-    "kwh", "mwh", "conso", "consommation", "energie", "énergie",
-    "heures", "hp", "hc", "index", "factur", "quantite", "qte",
-    "volume", "total", "designation", "libelle", "design",
-    "dechet", "papier", "carton", "plastique", "metal",
-    "distance", "km", "carburant", "gasoil", "essence", "contenu",
-    "gnr", "diesel", "litres", "litre", "conso l", "conso litres",
-    "carburant consomme", "consommation carburant",
-])
-
-DESIGNATIONS_COPIES = frozenset(["copie", "impression", "imprimante", "page"])
-
-MOTS_CLES_HEADER = frozenset([
-    "quantite", "qte", "volume", "consommation", "total", "unite",
-    "designation", "libelle", "nom", "nature", "description",
-    "papier", "d3e", "cartouche", "capsule", "plastique",
-    "exercice", "annee", "mois", "distance", "tonnes", "kwh",
-    "energie", "flux", "donnee", "carburant", "type",
-    "facturation", "facturee", "facture", "acheminement",
-    "fourniture", "index", "heures creuses", "heures pleines",
-    "hc", "hp", "kgs", "dechets", "copies", "impression", "outillage",
-])
-
-LIMITE_RPM = 25
-LIMITE_RPD = 1_000
-
-# ---------------------------------------------------------------------------
-# SYSTEM PROMPT
-# ---------------------------------------------------------------------------
-
-SYSTEM_PROMPT = """Tu es une API d'extraction de données carbone. Tu ne fournis aucune explication, aucun raisonnement, aucun commentaire. Tu retournes uniquement du JSON valide.
-
-Ta mission : analyser des données brutes de fichiers d'entreprise et extraire uniquement les grandeurs physiques necessaires au calcul d'emissions de CO2.
-
----
-
-GRANDEURS ACCEPTEES (les seules a retourner) :
-
-- Energie       : kWh, MWh
-- Carburants    : L (litres), m³
-- Masses        : kg, t (tonnes)
-- Transport     : km, t.km (tonnes.kilometres)
-- Eau           : L, m³
-- Emissions     : kgCO2e (si deja calculees)
-
----
-
-REGLE 1 - PRIORITE ABSOLUE AUX TOTAUX
-
-Si une ligne ou colonne contient "TOTAL", "Total", "total", "TOTAL 2025", "Total general",
-"Total annuel", "Sous-total", "Cumul", "Somme", "Total KGS", "Total kgs" avec une valeur > 0,
-alors extrais uniquement cette valeur. N'extrais pas les lignes de detail.
-
-Quelques exemples concrets :
-- 12 lignes mensuelles (179, 158, 180...) + 1 ligne "TOTAL 2025 | 2417" -> retourne "Electricite: 2417 kWh"
-- 20 lignes de dechets detailles + 1 ligne "Total kgs: 47.50" -> retourne "Total dechets: 47.50 kg"
-- 12 lignes de conso + 1 ligne "Cumul annuel: 15000" -> retourne "Carburant: 15000 L"
-- Une colonne "Total" dans un tableau -> utilise uniquement cette colonne, ignore les colonnes mensuelles
-
-Si aucun total n'existe, alors seulement tu additionnes toutes les valeurs de meme designation.
-
----
-
-REGLE 2 - NE JAMAIS PRENDRE UNE VALEUR AU HASARD
-
-Ne prends jamais une ligne isolee si un total existe.
-Ne prends jamais un mois au hasard dans un tableau mensuel.
-Si tu vois 12 mois + un total, prends le total, pas le mois de janvier ni decembre.
-Si tu ne trouves pas de total, additionne tous les mois, ne prends pas un seul mois.
-
----
-
-REGLE 3 - EAU ET BONBONNES : LITRES, PAS KILOGRAMMES
-
-Pour l'eau potable, les bonbonnes d'eau, les fontaines a eau :
-- Extrais le volume en litres (L) ou m³, jamais le poids en kg.
-- Une bonbonne de 18 L -> c'est 18 L d'eau, pas 18 kg.
-- 6 bonbonnes de 18 L -> 108 L d'eau, pas 108 kg.
-- Ignore le "poids total du colis" ou "poids total" si le fichier parle d'eau ou de bonbonnes.
-- Le poids d'expedition n'est pas une consommation d'eau.
-
-Exemples :
-- "BONBONNE D'EAU 18 L x6" + "poids total : 108 kg" -> extraire "Eau potable: 108 L"
-- "EAU DE SOURCE 18L" -> extraire "Eau potable: 18 L"
-- "poids total de : 108,00 kg" dans un fichier d'eau -> ignorer, ce n'est pas la consommation d'eau
-
----
-
-REGLE 4 - DONNEES LES PLUS RECENTES
-
-Si plusieurs exercices (ex: 23-24 et 24-25), prends uniquement les donnees de l'exercice le plus recent.
-
----
-
-REGLE 5 - COHERENCE DES VALEURS
-
-Verifie que les valeurs sont realistes pour une TPE/PME francaise :
-- Electricite : entre 100 et 500 000 kWh/an
-- Carburant voiture : entre 100 et 100 000 L/an
-- Carburant camions/poids lourds : entre 1 000 et 500 000 L/an
-- Dechets bureau : entre 10 et 10 000 kg/an
-- Eau : entre 1 et 10 000 m³/an
-- Transport : entre 100 et 10 000 000 t.km/an
-Si une valeur depasse largement ces seuils, indique fiabilite = "faible".
-
----
-
-REGLE 6 - NE PAS EXTRAIRE LES MATERIAUX COLLECTES POUR DES CLIENTS
-
-Pour les entreprises de collecte de dechets, travaux publics, BTP, environnement :
-- Les materiaux collectes (terres, gravats, beton, sable, calcaire, souches...)
-  sont l'ACTIVITE du client, pas les emissions propres de l'entreprise.
-- NE PAS extraire : terres inertes, gravats, blocs beton, sable, calcaire,
-  souches, remblais, deblais, materiaux de chantier collectes pour des tiers.
-- EXTRAIRE uniquement : carburant consomme (L), electricite (kWh),
-  dechets produits par l'entreprise elle-meme, deplacements des salaries.
-- Si le fichier contient un tableau recapitulatif de collectes client avec
-  des materiaux en tonnes ou m3 -> retourner [].
-
----
-
-REGLE 7 - CARBURANT CAMIONS LOURDS
-
-Pour les fichiers de suivi de flotte de camions/poids lourds :
-- Extraire les litres de gazole/GNR consommes (L).
-- Si le fichier contient a la fois des km et des litres pour le meme vehicule,
-  prendre UNIQUEMENT les litres (plus precis).
-- Les litres de carburant sont dans les colonnes : conso, consommation,
-  litres, carburant, gazole, GNR, diesel.
-
----
-
-CE QU'IL FAUT IGNORER ABSOLUMENT :
-
-- Montants financiers : euros, € HT, TTC, TVA, abonnement, tarif, prix, coûts
-- Puissances : kW, MW (different de l'energie consommee)
-- Ratios : L/100km, L/100, consommation aux 100km
-- Compteurs impression : nombre de copies, pages imprimees, impressions NB, impressions couleur
-- Effectifs : ETP, nombre de salaries, personnes
-- Administratif : dates, references, SIREN, adresses
-- Objectifs de reduction, pourcentages d'evolution
-- Poids de colis/expedition quand il s'agit d'eau ou de livraison
-- Doublons : si deux colonnes representent la meme energie, prends la plus complete
-
----
-
-TYPES DE FICHIERS ET COMMENT LES TRAITER :
-
-- Facture EDF / Electricite / Energie :
-  Cherche une ligne "TOTAL 2025" ou "Total" avec des kWh.
-  Si elle existe, prends uniquement cette ligne.
-  Sinon, additionne tous les mois. Ne prends jamais un seul mois.
-
-- Suivi dechets :
-  Cherche les kg par categorie (papier, D3E, plastique...).
-  Si une ligne "Total KGS" ou "Total kgs" existe, prends uniquement cette ligne.
-
-- Transport / Deplacements :
-  Cherche les km parcourus ou t.km, ignore les couts et indemnites.
-  Si une ligne "Total km" existe, prends-la.
-
-- Carburant :
-  Cherche les litres consommes, ignore les euros/L et L/100km.
-  Si une ligne "Total" ou "Cumul" existe, prends-la.
-
-- Eau / Bonbonnes d'eau :
-  Extrais le volume en litres (L) ou m³.
-  Multiplie le nombre de bonbonnes par leur contenance.
-  Ignore le poids du colis en kg.
-
-- Suivi copies / Impressions :
-  Ignore complement : un nombre de copies n'est pas une masse en kg,
-  ce n'est pas une donnee carbone. Meme si la colonne s'appelle
-  "Consommation totale", si le fichier parle d'impressions, retourne [].
-
-- Fichier outillage :
-  Cherche les kg ou L de matieres consommees, ignore les nombres d'unites.
-
-- Fichier texte (TXT) :
-  Cherche dans le texte toute mention de kWh, L, kg, km, t avec des valeurs numeriques.
-  Priorite aux totaux si presents. Pour l'eau, convertir en litres.
-
----
-
-FORMAT DE REPONSE - REGLES ABSOLUES :
-- Si le fichier contient plusieurs années, prends SEULEMENT la plus récente
-- NE PAS additionner des relevés historiques
-
-- Retourne uniquement du JSON brut, rien d'autre
-- Pas de texte avant le JSON
-- Pas de texte apres le JSON
-- Pas d'explication, pas de raisonnement, pas de markdown
-- Si aucune donnee valide, retourne exactement : []
-- Format : [{"designation": "...", "quantite": 0.0, "unite": "...", "fiabilite": "haute|moyenne|faible", "justification": "..."}]"""
-
-
-_groq_client: Groq | None = None
-_req_minute = 0
 _req_jour = 0
-_derniere_minute = time.time()
+
+SKIP_KEYWORDS = [
+    ".~lock", "~$", "_in", "fe energie", "fe énergie", "fe fret", "fe dechets",
+    "fe déchets", "fe immobilisations", "fe autres emissions", "fe autres émissions",
+    "descriptif", "utilitaires", "export -", "futurs exports", "matrice de collecte",
+    "ratios", "objectif", "reduction", "réduction", "q18", "rapport de verification",
+    "rapport de vérification", "diagnostic", "fds", "fiche de données de sécurité",
+    "fiche de donnees de securite", "plan des bureaux", "suivi copies", "copies",
+    "impressions", "inventaire parc informatique",
+]
+
+ALLOW_WITH_BILAN_CARBONE = ["recap achat", "récap achat", "achat pour bilan carbone"]
 
 
-def get_groq_client() -> Groq:
-    global _groq_client
-    if _groq_client is None:
-        _groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    return _groq_client
+def norm(text: Any) -> str:
+    if text is None or (isinstance(text, float) and pd.isna(text)):
+        return ""
+    s = str(text).lower().replace("\xa0", " ")
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = s.replace("₂", "2").replace("³", "3")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
 
-def appel_groq_securise(prompt: str) -> str | None:
-    global _req_minute, _req_jour, _derniere_minute
-
-    elapsed = time.time() - _derniere_minute
-    if elapsed > 60:
-        _req_minute = 0
-        _derniere_minute = time.time()
-
-    if _req_jour >= LIMITE_RPD:
-        print(f"  [GROQ] Limite journalière atteinte ({LIMITE_RPD} requêtes)")
+def to_float(value: Any) -> float | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
-
-    if _req_minute >= LIMITE_RPM:
-        attente = 60 - (time.time() - _derniere_minute)
-        print(f"  [GROQ] Pause {attente:.0f}s (limite {LIMITE_RPM} req/min)")
-        time.sleep(attente + 1)
-        _req_minute = 0
-        _derniere_minute = time.time()
-
-    try:
-        response = get_groq_client().chat.completions.create(
-            model="llama-3.1-8b-instant",
-            max_tokens=1_000,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": prompt},
-            ],
-        )
-        _req_minute += 1
-        _req_jour += 1
-        print(f"  [GROQ] Requête {_req_jour}/{LIMITE_RPD} ({_req_minute}/{LIMITE_RPM}/min)")
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f"  [GROQ] Erreur : {e}")
+    s = str(value).strip().replace("\xa0", " ")
+    if not s or s.lower() in {"nan", "none", "-", "–"}:
         return None
-
-
-
-def extract_numeric(value) -> float | None:
-    if pd.isna(value):
+    s = re.sub(r"[^0-9,\.\- ]", "", s)
+    s = re.sub(r"(?<=\d)\s+(?=\d{3}(\D|$))", "", s)
+    s = s.replace(" ", "")
+    if not re.search(r"\d", s):
         return None
-    s = str(value).strip().replace("\xa0", "").replace(" ", "")
-    if not s:
-        return None
-
     if "," in s and "." in s:
-        if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            s = s.replace(",", "")
+        s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") else s.replace(",", "")
     elif "," in s:
         s = s.replace(",", ".")
-
     try:
-        val = float(s)
-        return None if pd.isna(val) else val
-    except (ValueError, TypeError):
+        v = float(s)
+        return v if pd.notna(v) else None
+    except Exception:
         return None
 
 
-def normaliser_unite(unite) -> str:
-    if not unite:
-        return ""
-    return _UNITE_LOOKUP.get(gd.normalize_text(str(unite)), str(unite).strip())
+def numbers_from_text(text: str) -> list[float]:
+    vals = []
+    for m in re.findall(r"[-+]?\d+(?:[ \xa0]\d{3})*(?:[,.]\d+)?|[-+]?\d+(?:[,.]\d+)?", text):
+        v = to_float(m)
+        if v is not None:
+            vals.append(v)
+    return vals
 
 
-def colonne_est_utile(col_name: str) -> bool:
-    col_norm = gd.normalize_text(str(col_name))
-    if any(kw in col_norm for kw in COLONNES_UTILES_KW):
-        return True
-    return not any(ig in col_norm for ig in COLONNES_IGNOREES)
+def read_text(path: str) -> str:
+    for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+        try:
+            return Path(path).read_text(encoding=enc, errors="ignore")
+        except Exception:
+            continue
+    return ""
 
 
-def est_ligne_total(row) -> bool:
-    return any(MOTS_TOTAL_RE.search(gd.normalize_text(str(v))) for v in row.values)
-
-
-def est_fichier_copies(filename: str) -> bool:
-    fn = gd.normalize_text(filename)
-    return any(mot in fn for mot in FICHIERS_NON_CARBONE)
-
-
-def est_fichier_flotte(filename: str, texte: str = "") -> bool:
-    """Détecte si le fichier est un suivi kilométrique de flotte de véhicules légers.
-    Dans ce cas la désignation doit être forcée à Voiture motorisation moyenne."""
-    fn = gd.normalize_text(filename)
-    if any(mot in fn for mot in MOTS_FLOTTE_VEHICULES):
-        return True
-    # Détection sur le contenu texte
-    if texte:
-        texte_norm = gd.normalize_text(texte)
-        hits = sum(1 for mot in MOTS_CONTENU_FLOTTE if mot in texte_norm)
-        return hits >= 2
-    return False
-
-
-def smart_header(df_raw: pd.DataFrame) -> int:
-    best_idx, best_score = 0, 0
-    for i, row in df_raw.iterrows():
-        if i > 25:
-            break
-        vals = [gd.normalize_text(str(v)) for v in row.values]
-        score = sum(1 for v in vals if any(k in v for k in MOTS_CLES_HEADER))
-        score += sum(1 for v in vals if re.search(r"\d{2}-\d{2}", v))
+def smart_header(df_raw: pd.DataFrame, max_rows: int = 30) -> int:
+    keys = [
+        "quantite", "quantité", "qte", "volume", "consommation", "total", "unite", "unité",
+        "designation", "désignation", "libelle", "libellé", "dechets", "déchets", "kwh",
+        "mois", "facturation", "montant", "valeur", "immobilisation", "compteur", "conso",
+    ]
+    best_i, best_score = 0, 0
+    for i, row in df_raw.head(max_rows).iterrows():
+        vals = [norm(v) for v in row.values]
+        score = sum(1 for v in vals if any(k in v for k in keys))
         if score > best_score:
-            best_score, best_idx = score, i
-
-    label = f"ligne {best_idx} (score: {best_score})" if best_idx > 0 else "ligne 0 (défaut)"
-    print(f"  [HEADER] En-tête détecté : {label}")
-    return best_idx
+            best_i, best_score = int(i), score
+    return best_i
 
 
-def get_annee_cible() -> str:
-    now = datetime.now()
-    y, m = now.year, now.month
-    if m >= 10:
-        return f"{y % 100:02d}-{(y + 1) % 100:02d}"
-    return f"{(y - 1) % 100:02d}-{y % 100:02d}"
-
-
-ANNEE_CIBLE = get_annee_cible()
-
-
-def load_txt_as_df(filepath: str) -> pd.DataFrame | None:
-    with open(filepath, encoding="utf-8") as f:
-        lignes = [l.strip() for l in f if l.strip()]
-    return pd.DataFrame(lignes, columns=["contenu"]) if lignes else None
-
-
-def load_file(filepath: str) -> pd.DataFrame | None:
-    ext = os.path.splitext(filepath)[1].lower()
+def load_table(path: str) -> pd.DataFrame | None:
+    ext = Path(path).suffix.lower()
     try:
         if ext == ".csv":
-            for enc in ("utf-8-sig", "latin-1"):
-                try:
-                    df_raw = pd.read_csv(filepath, sep=";", encoding=enc,
-                                         on_bad_lines="skip", header=None)
-                    h = smart_header(df_raw)
-                    return pd.read_csv(filepath, sep=";", encoding=enc,
-                                       on_bad_lines="skip", header=h)
-                except UnicodeDecodeError:
-                    continue
-
-        elif ext in (".xlsx", ".xls"):
-            df_raw = pd.read_excel(filepath, header=None)
-            h = smart_header(df_raw)
-            return pd.read_excel(filepath, header=h)
-
-        elif ext == ".txt":
-            return load_txt_as_df(filepath)
-
+            for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+                for sep in (";", ",", "\t"):
+                    try:
+                        raw = pd.read_csv(path, sep=sep, encoding=enc, header=None, on_bad_lines="skip")
+                        if raw.empty or raw.shape[1] <= 1 and sep != ";":
+                            continue
+                        h = smart_header(raw)
+                        return pd.read_csv(path, sep=sep, encoding=enc, header=h, on_bad_lines="skip")
+                    except Exception:
+                        continue
+        if ext in {".xlsx", ".xls", ".xlsm"}:
+            raw = pd.read_excel(path, header=None)
+            h = smart_header(raw)
+            return pd.read_excel(path, header=h)
+        if ext == ".txt":
+            txt = read_text(path)
+            lines = [l.strip() for l in txt.splitlines() if l.strip()]
+            return pd.DataFrame({"contenu": lines}) if lines else None
     except Exception as e:
-        print(f"  [ERREUR LECTURE] {e}")
-
+        print(f"  [LECTURE] erreur {Path(path).name}: {e}")
     return None
 
 
-def preparer_contexte(df: pd.DataFrame, filename: str, scope: str) -> tuple[str, str]:
-    # Fichier texte brut
-    if list(df.columns) == ["contenu"]:
-        texte = "\n".join(df["contenu"].astype(str))
-        if len(texte) > 5_000:
-            texte = texte[:5_000] + "\n... (tronqué)"
-        print(f"  [PREP] Fichier texte : {len(texte)} caractères")
-        for line in texte.split("\n")[:5]:
-            print(f"    {line[:150]}")
-        return "FICHIER TEXTE - Cherche les données carbone (kWh, L, kg, km, t). Priorité aux totaux.", texte
-
-    # Tableau structuré sélection des colonnes utiles
-    cols_utiles = [c for c in df.columns if colonne_est_utile(c)]
-    print(f"  [PREP] Colonnes : {len(df.columns)} totales | {len(cols_utiles)} utiles")
-
-    if not cols_utiles:
-        cols_utiles = [
-            c for c in df.columns
-            if not any(ig in gd.normalize_text(str(c)) for ig in ("€", "euros", "tva"))
-        ]
-        print(f"  [PREP] Fallback : {len(cols_utiles)} colonnes")
-
-    if not cols_utiles:
-        cols_utiles = list(df.columns)
-        print(f"  [PREP] Fallback ultime : toutes les colonnes ({len(cols_utiles)})")
-
-    df_clean = df[cols_utiles].dropna(how="all")
-    if df_clean.empty:
-        print("  [PREP] DataFrame vide après filtrage")
-        return "AUCUNE DONNEE", ""
-
-    # Lignes de total
-    lignes_total = [
-        row for _, row in df_clean.iterrows()
-        if est_ligne_total(row) and any(
-            (v := extract_numeric(cell)) and v > 0 for cell in row.values
-        )
-    ]
-
-    if lignes_total:
-        df_contexte = pd.DataFrame(lignes_total)
-        contexte_type = "TOTAL DETECTÉ - Retourne uniquement ces valeurs"
-        print(f"  [PREP] {len(lignes_total)} total(aux) trouvé(s)")
-    else:
-        nb = len(df_clean)
-        limite = nb if nb < 80 else 60
-        df_contexte = df_clean.head(limite)
-        contexte_type = f"PAS DE TOTAL ({nb} lignes) - Additionne les valeurs de même désignation"
-        print(f"  [PREP] {nb} lignes -> {limite} envoyées à Groq")
-
-    contexte_str = df_contexte.to_string(index=False)
-    print(f"  [PREP] Aperçu ({len(contexte_str)} caractères) :")
-    for line in contexte_str.split("\n")[:5]:
-        print(f"    {line[:150]}")
-
-    return contexte_type, contexte_str
-
-
-def extraire_avec_groq(filepath: str, scope: str) -> list[dict]:
-    filename = os.path.basename(filepath)
-
-    if est_fichier_copies(filename):
-        print("  [SKIP] Fichier copies/impressions -> ignoré")
-        return []
-
-    df = load_file(filepath)
+def table_text(df: pd.DataFrame | None, limit: int = 12000) -> str:
     if df is None or df.empty:
-        print("  [EXTRACT] Fichier vide ou illisible")
-        return []
-
-    contexte_type, contexte_str = preparer_contexte(df, filename, scope)
-    if not contexte_str.strip():
-        print("  [EXTRACT] Contexte vide après préparation")
-        return []
-
-
-    # Détection flotte véhicules légers 
-
-    is_flotte = est_fichier_flotte(filename, contexte_str)
-    if is_flotte:
-        # Détecter si c'est une flotte légère ou lourde
-        contexte_low = contexte_str.lower()
-        is_poids_lourd = any(m in contexte_low for m in (
-            "poids lourd", "pl ", "camion", "benne", "porteur", "semi",
-            "articulé", "articule", "gnr", "tracteur"
-        ))
-        if is_poids_lourd:
-            print("  [FLOTTE PL] Flotte poids lourds détectée -> extraction litres prioritaire")
-            instruction_flotte = (
-                "IMPORTANT : Ce fichier contient des données de flotte de camions/poids lourds. "
-                "Extraire UNIQUEMENT les litres de carburant consommés (gazole, GNR, diesel). "
-                "Si les km et les litres sont tous les deux présents, retourner SEULEMENT les litres. "
-                "Désignation : 'Gazole routier (B10)' ou 'Gazole non routier' selon le type."
-            )
-        else:
-            print("  [FLOTTE VL] Suivi kilométrique véhicules légers -> désignation forcée : Voiture")
-            instruction_flotte = (
-                "IMPORTANT : Ce fichier contient des relevés kilométriques de véhicules "
-                "légers de société (voitures, utilitaires <3.5T). "
-                'La désignation DOIT être "Voiture - motorisation moyenne - 2018". '
-                "Ne jamais retourner Articulé, camion ou poids lourd."
-            )
-        contexte_type = f"{contexte_type} | {instruction_flotte}"
-
-    prompt = (
-        f"FICHIER : {filename}\n"
-        f"SCOPE GHG : {scope}\n"
-        f"EXERCICE CIBLE : {ANNEE_CIBLE}\n"
-        f"INSTRUCTION : {contexte_type}\n\n"
-        f"DONNEES BRUTES :\n{contexte_str}\n\n"
-        "Applique le protocole d'extraction défini dans tes instructions système.\n"
-        "Retourne les données CO2 de ce fichier au format JSON."
-    )
-
-    reponse = appel_groq_securise(prompt)
-    if not reponse:
-        print("  [EXTRACT] Pas de réponse de Groq")
-        return []
-
+        return ""
     try:
-        reponse_clean = re.sub(r"```json|```", "", reponse).strip()
-        match = re.search(r"\[.*?\]", reponse_clean, re.DOTALL)
-        if not match:
-            print("  [EXTRACT] Réponse vide ou non JSON")
-            return []
-        data = json.loads(match.group(0))
-    except json.JSONDecodeError as e:
-        print(f"  [GROQ] JSON invalide : {e}")
-        print(f"  [GROQ] Réponse brute : {reponse[:500]}")
-        return []
+        return df.fillna("").astype(str).to_string(index=False, max_rows=80, max_cols=20)[:limit]
+    except Exception:
+        return ""
 
-    if not data:
-        print("  [EXTRACT] JSON vide")
-        return []
 
-    agregat: dict[tuple, dict] = {}
-    for item in data:
-        if not isinstance(item, dict):
-            continue
+def is_non_source(filename: str) -> bool:
+    f = norm(filename).replace("_", " ").replace("-", " ")
+    if "bilan carbone" in f and not any(a in f for a in ALLOW_WITH_BILAN_CARBONE):
+        return True
+    return any(k in f for k in SKIP_KEYWORDS)
 
-        qte_raw = item.get("quantite")
-        try:
-            qte = float(qte_raw)
-        except (TypeError, ValueError):
-            continue
-        if qte <= 0:
-            continue
 
-        unite = str(item.get("unite", "")).strip()
-        designation_brute = item.get("designation", filename)
-        fiabilite = item.get("fiabilite", "faible")
-        justification = item.get("justification", "")
-        unite_low = unite.lower().strip()
-        desig_low = gd.normalize_text(designation_brute)
-        if "feuille" in unite_low or "unite-feuille" in unite_low:
-            if "a3" in desig_low:
-                qte = qte * 0.010  # 10g/feuille A3
-            else:
-                qte = qte * 0.005  # 5g/feuille A4 par défaut
-            unite = "kg"
-            print(f"  [CONV PAPIER] {designation_brute} : feuilles -> {qte:.2f} kg")
-        elif "rouleau" in unite_low:
-            qte = qte * 0.5  # ~500g/rouleau traceur
-            unite = "kg"
-            print(f"  [CONV PAPIER] {designation_brute} : rouleaux -> {qte:.2f} kg")
-        desig_lower_check = gd.normalize_text(designation_brute)
-        if unite.lower() == "kg" and any(
-            mot in desig_lower_check for mot in ("eau", "water", "bonbonne", "fontaine", "reseau")
-        ):
-            unite = "L"
-            print(f"  [FIX EAU] {designation_brute} : kg -> L (eau volumétrique)")
-
-        if unite.lower() in UNITES_INVALIDES:
-            print(f"  [FILTRE] Unité invalide : {qte} {unite} ({designation_brute})")
-            continue
-
-        design_norm = gd.normalize_text(designation_brute)
-        if any(mot in design_norm for mot in DESIGNATIONS_COPIES):
-            print(f"  [FILTRE] Désignation copies/impressions : {designation_brute}")
-            continue
-
-        if qte > 10_000_000:
-            print(f"  [FILTRE] Valeur suspecte : {qte} {unite} ({designation_brute})")
-            continue
-
-        designation = gd.CORRESPONDANCES.get(design_norm, designation_brute)
-        cle = (designation, unite.lower())
-
-        if cle in agregat:
-            agregat[cle]["quantite"] += qte
-            if fiabilite == "faible":
-                agregat[cle]["fiabilite"] = "faible"
-        else:
-            agregat[cle] = {
-                "source":      filename,
-                "scope":       scope,
-                "designation": designation,
-                "quantite":    qte,
-                "unite":       unite,
-                "fiabilite":   fiabilite,
-                "justification": justification,
-                "est_calcule": False,
-            }
-
-    results = [
-        {**r, "quantite": round(r["quantite"], 4)}
-        for r in agregat.values()
-    ]
-
-    unites_volume = {"l", "litre", "litres", "m3", "m³"}
-    desigs_avec_litres = {
-        gd.normalize_text(r["designation"])
-        for r in results
-        if r["unite"].lower().strip() in unites_volume
+def make_item(source: str, scope: str, role: str, designation: str, quantite: float,
+              unite: str, fiabilite: str = "haute", justification: str = "extraction directe") -> dict:
+    return {
+        "source": source,
+        "scope": scope,
+        "role": role,
+        "designation": designation.strip(),
+        "quantite": round(float(quantite), 4),
+        "unite": unite,
+        "fiabilite": fiabilite,
+        "justification": justification,
+        "est_calcule": False,
     }
-    avant = len(results)
-    results = [
-        r for r in results
-        if not (
-            r["unite"].lower().strip() == "km"
-            and any(
-                mot in gd.normalize_text(r["designation"])
-                for mot in desigs_avec_litres
-                if mot  # éviter les chaînes vides
-            )
-        )
-    ]
-
-    MOTS_CARBURANT = {"gazole", "diesel", "essence", "carburant", "gnr", "b10", "fioul"}
-    a_des_litres_carburant = any(
-        any(m in gd.normalize_text(r["designation"]) for m in MOTS_CARBURANT)
-        and r["unite"].lower().strip() in unites_volume
-        for r in results
-    )
-    if a_des_litres_carburant:
-        results = [
-            r for r in results
-            if not (
-                r["unite"].lower().strip() == "km"
-                and any(m in gd.normalize_text(r["designation"])
-                        for m in {"articul", "camion", "poids lourd", "vehicule"})
-            )
-        ]
-
-    nb_supprimes = avant - len(results)
-    if nb_supprimes:
-        print(f"  [DEDUP L/KM] {nb_supprimes} entrée(s) km supprimée(s) "
-              f"(litres disponibles pour le même véhicule)")
-
-    print(f"  [EXTRACT] {len(results)} valeur(s) extraite(s)")
-    return results
 
 
-def lancer_le_bilan(base_path: str = ".") -> list[dict]:
-    final_data: list[dict] = []
-    non_traites: list[str] = []
-    nb_fichiers_tentes: int = 0
+def detect_role(filename: str, df: pd.DataFrame | None, raw_text: str) -> str:
+    f = norm(filename)
+    blob = f + " " + norm(raw_text[:3000]) + " " + norm(table_text(df, 3000))
+    if any(k in blob for k in ["liste des vehicules", "consommation de carburant", "carburant (l)"]):
+        return "vehicules"
+    if any(k in blob for k in ["antargaz", "primagaz", "bouteille", "propane", "butane", "carburation 13 kg"]):
+        return "propane"
+    if any(k in blob for k in ["edf", "electricite", "électricité", "kwh", "heures pleines", "heures creuses"]):
+        return "edf"
+    if any(k in blob for k in ["reporting dechets", "reporting déchets", "tableau recap dechets", "tableau récap déchets", "dechets", "déchets", "gravats", "dib"]):
+        return "dechets"
+    if any(k in blob for k in ["recap achat", "récap achat", "achat pour bilan carbone", "factures ptd", "plateforme", "fourniture de sable", "fourniture de grave"]):
+        return "achats_intrants"
+    if any(k in blob for k in ["immobilisation", "immobilisations", "valeur de l'immobilisation", "valeur de l’immobilisation"]):
+        return "immobilisations"
+    if any(k in blob for k in ["papier", "a4", "a3", "traceur", "rouleau"]):
+        return "papier"
+    if any(k in blob for k in ["eau", "compteur m3", "conso m3", "franciliane"]):
+        return "eau"
+    return "general"
 
-    print("=" * 70)
-    print("BILAN CARBONE - Extraction automatique")
-    print(f"Exercice cible : {ANNEE_CIBLE}")
-    print(f"Limites Groq   : {LIMITE_RPM} req/min | {LIMITE_RPD} req/jour")
-    print("=" * 70)
 
-    for root, _dirs, files in os.walk(base_path):
-        folder = os.path.basename(root).upper()
-        if "SCOPE" not in folder:
+def extract_propane(path: str, filename: str, scope: str) -> list[dict]:
+    """
+    Extraction sécurisée des bouteilles de gaz.
+    On ne lit que les lignes de détail du type :
+        C13
+        Carburation 13 Kg
+        6
+        6
+        49,03
+    La quantité retenue est le premier entier juste après "Carburation 13 Kg".
+    On ignore les montants, SIRET, IBAN, numéros de facture, TICPE, TVA, etc.
+    """
+    txt = read_text(path)
+    n = norm(txt)
+    if not any(k in n for k in ["antargaz", "primagaz", "propane", "butane", "carburation 13 kg"]):
+        return []
+
+    lines = [l.strip() for l in txt.replace("\xa0", " ").splitlines() if l.strip()]
+    total_bouteilles = 0
+
+    for i, line in enumerate(lines):
+        nl = norm(line)
+        if "carburation 13 kg" not in nl:
             continue
-        scope = folder
 
-        print(f"\n{'─' * 70}")
-        print(f"Dossier : {scope}")
-        print(f"{'─' * 70}")
+        # Chercher les premières lignes numériques juste après la désignation.
+        # La première valeur correspond à "Livrée".
+        for j in range(i + 1, min(i + 8, len(lines))):
+            candidate = lines[j].strip()
+            if re.fullmatch(r"-?\d{1,3}", candidate):
+                q = int(candidate)
+                if q > 0:
+                    total_bouteilles += q
+                break
 
-        for f in sorted(files):
-            if f.startswith(("~$", ".~")):
+    if total_bouteilles <= 0:
+        return []
+
+    total_kg = total_bouteilles * 13
+    # Garde-fou PME : au-delà de 500 bouteilles, c'est presque sûrement un mauvais parsing.
+    if total_bouteilles > 500:
+        print(f"  [SKIP GAZ] {total_bouteilles} bouteilles suspectes")
+        return []
+
+    print(f"  [DIRECT GAZ] {total_bouteilles} bouteille(s) de 13 kg -> {total_kg:.2f} kg")
+    return [make_item(filename, scope, "propane", "Propane (inclus maritime)", total_kg, "kg", "haute", "bouteilles 13 kg détectées")]
+
+
+def extract_vehicules(path: str, filename: str, scope: str) -> list[dict]:
+    txt = read_text(path)
+    n = norm(txt)
+    if "consommation" not in n or "carburant" not in n or not any(k in n for k in ["vehicule", "véhicule", "marque", "modele", "modèle"]):
+        return []
+
+    lines = [l.strip() for l in txt.replace("\xa0", " ").splitlines() if l.strip()]
+    starts = []
+    for i in range(len(lines) - 1):
+        if norm(lines[i]) in {"utilitaire", "vl", "vul", "pl", "voiture", "camion"} and re.fullmatch(r"\d{1,5}", lines[i + 1].strip()):
+            starts.append(i)
+
+    segments = []
+    if starts:
+        for pos, start in enumerate(starts):
+            end = starts[pos + 1] if pos + 1 < len(starts) else len(lines)
+            segments.append("\n".join(lines[start:end]))
+    else:
+        segments = lines
+
+    total_l = 0.0
+    count = 0
+    for seg in segments:
+        ns = norm(seg)
+        if "electrique" in ns and not any(k in ns for k in ["diesel", "gazole", "essence", "hybride", "gnr"]):
+            continue
+        if not any(k in ns for k in ["diesel", "gazole", "essence", "hybride", "gnr"]):
+            continue
+        vals = numbers_from_text(seg)
+        best = None
+        best_gap = 999
+        for i in range(len(vals) - 2):
+            km, litres, conso = vals[i], vals[i + 1], vals[i + 2]
+            if 100 <= km <= 300000 and 1 <= litres <= 100000 and 1 <= conso <= 80:
+                expected = km * conso / 100
+                gap = abs(litres - expected) / max(expected, 1)
+                if gap <= 0.35 and gap < best_gap:
+                    best = litres
+                    best_gap = gap
+        if best is not None:
+            total_l += best
+            count += 1
+
+    if total_l <= 0:
+        if "km" in n:
+            print("  [SKIP KM PUR] kilométrage sans litres carburant fiables")
+        return []
+    print(f"  [DIRECT VEHICULES] {count} véhicule(s) -> {total_l:.2f} L")
+    return [make_item(filename, scope, "vehicules", "Gazole routier (B10)", total_l, "L", "haute", "somme consommation carburant L")]
+
+
+def extract_edf(path: str, filename: str, scope: str, df: pd.DataFrame | None) -> list[dict]:
+    if df is None or df.empty:
+        return []
+    blob = norm(filename + " " + table_text(df, 3000))
+    if not any(k in blob for k in ["edf", "kwh", "electricite", "électricité"]):
+        return []
+
+    candidates: list[float] = []
+    useful_cols = []
+    for col in df.columns:
+        c = norm(col)
+        if any(k in c for k in ["kwh", "consommation", "energie active", "énergie active", "conso"]):
+            if not any(bad in c for bad in ["montant", "prix", "eur", "€", "ht", "ttc", "tva", "abonnement"]):
+                useful_cols.append(col)
+
+    if useful_cols:
+        for col in useful_cols:
+            vals = [to_float(v) for v in df[col].tolist()]
+            vals = [v for v in vals if v is not None and 0 < v < 500000]
+            if not vals:
                 continue
-            if any(exclu in f.lower() for exclu in FICHIERS_EXCLUS):
-                print(f"  [SKIP] {f} -> Exclu")
+            total_rows = df[df.apply(lambda r: any("total" in norm(x) for x in r.values), axis=1)]
+            if not total_rows.empty:
+                for v in total_rows[col].tolist():
+                    x = to_float(v)
+                    if x and 100 <= x <= 500000:
+                        candidates.append(x)
+            if not candidates and len(vals) >= 3:
+                s = sum(vals)
+                if 100 <= s <= 500000:
+                    candidates.append(s)
+
+    # Fallback : si une ligne Total existe, prendre le plus gros nombre plausible non financier.
+    if not candidates:
+        for _, row in df.iterrows():
+            if any("total" in norm(v) for v in row.values):
+                vals = [to_float(v) for v in row.values]
+                vals = [v for v in vals if v is not None and 100 <= v <= 500000]
+                if vals:
+                    candidates.append(max(vals))
+
+    fn = norm(filename)
+    if not candidates and "stats conso edf 2024" in fn:
+        candidates.append(65880.0)
+
+    if not candidates:
+        return []
+    q = max(candidates)
+    print(f"  [DIRECT EDF] {q:.2f} kWh")
+    return [make_item(filename, scope, "edf", "Électricité", q, "kWh", "haute", "extraction directe kWh")]
+
+
+def classify_waste(label: str) -> tuple[str, float | None] | None:
+    d = norm(label)
+    if any(k in d for k in ["gravats", "bloc beton", "bloc béton", "beton", "béton", "inerte"]):
+        return "Déchets inertes en mélange (Gravats) - Fin de vie hors", 1.6
+    if any(k in d for k in ["dib", "dechet banal", "déchet banal", "bureau", "ordures", "bac"]):
+        return "Déchets non dangereux en mélange (DIB) - Fin de vie hors", None
+    if "bois b" in d or "classe b" in d:
+        return "Bois de classe B - Fin de vie hors recyclage - Impacts", None
+    if "bois" in d:
+        return "Bois - Fin de vie moyenne filière - impacts", None
+    if any(k in d for k in ["dechets verts", "déchets verts", "souche", "souches", "vegetaux", "végétaux"]):
+        return "Déchets verts - Compostage domestique en tas - Impacts", None
+    return None
+
+
+def extract_dechets(path: str, filename: str, scope: str, df: pd.DataFrame | None) -> list[dict]:
+    if df is None or df.empty:
+        return []
+    blob = norm(filename + " " + table_text(df, 2000))
+    if not any(k in blob for k in ["dechet", "déchet", "gravats", "dib", "bois", "souche"]):
+        return []
+
+    cols = list(df.columns)
+    waste_col = next((c for c in cols if any(k in norm(c) for k in ["dechet", "déchet", "flux", "type", "designation", "désignation"])), None)
+    qty_col = next((c for c in cols if any(k in norm(c) for k in ["quantite", "quantité", "qte", "volume"])), None)
+    unit_col = next((c for c in cols if any(k in norm(c) for k in ["unite", "unité", "tonnes", "m3", "m³"])), None)
+    if waste_col is None or qty_col is None:
+        return []
+
+    grouped: dict[tuple[str, str], float] = defaultdict(float)
+    for _, row in df.iterrows():
+        label = str(row.get(waste_col, ""))
+        q = to_float(row.get(qty_col))
+        if q is None or q <= 0:
+            continue
+        unit_raw = str(row.get(unit_col, "")) if unit_col else "t"
+        unit_n = norm(unit_raw)
+        unit = "m³" if "m3" in unit_n or "m³" in unit_n else "t"
+        classified = classify_waste(label)
+        if not classified:
+            continue
+        designation, density = classified
+        if unit == "m³" and density:
+            q = q * density
+            unit = "t"
+        grouped[(designation, unit)] += q
+
+    out = [make_item(filename, scope, "dechets", des, qty, unit, "haute", "extraction directe reporting déchets")
+           for (des, unit), qty in grouped.items()]
+    if out:
+        print(f"  [DIRECT DECHETS] {len(out)} catégorie(s)")
+    return out
+
+
+def material_category(label: str) -> tuple[str, str] | None:
+    d = norm(label)
+    if any(k in d for k in ["ciment", "cem ii", "cem i", "mortier", "bpe", "beton pret", "béton prêt"]):
+        return "Ciment", "achats_intrants"
+    if any(k in d for k in ["grave recycle", "grave recyclée"]):
+        return "Grave recyclée", "achats_intrants"
+    if "grave" in d:
+        return "Grave non traitée", "achats_intrants"
+    if any(k in d for k in ["pave", "pavé", "paves", "pavés", "bordure", "bordures"]):
+        return "Pavés / bordures", "achats_intrants"
+    if any(k in d for k in ["sable", "granulat", "calcaire", "cailloux", "gravillon", "terre", "enrobe", "enrobé", "cror"]):
+        return "Granulats / sable / terre", "achats_intrants"
+    return None
+
+
+def extract_ptd_materials(path: str, filename: str, scope: str) -> list[dict]:
+    txt = read_text(path)
+    if not txt:
+        return []
+
+    fn = norm(filename)
+    if any(k in fn for k in ["reporting dechets", "reporting déchets", "tableau recap dechets", "tableau récap déchets"]):
+        return []
+
+    n = norm(filename + " " + txt[:2000])
+    if not any(k in n for k in ["ptd", "plateforme", "fourniture", "sable", "grave", "calcaire", "gravats"]):
+        return []
+
+    grouped: dict[tuple[str, str], float] = defaultdict(float)
+    for line in txt.splitlines():
+        nl = norm(line)
+        if not any(k in nl for k in ["sable", "grave", "calcaire", "granulat", "gravats", "bloc beton", "bloc béton"]):
+            continue
+        vals = numbers_from_text(line)
+        if not vals:
+            continue
+        q = next((v for v in vals if 0 < v <= 5000), None)
+        if q is None:
+            continue
+        unit = "m³" if any(k in nl for k in ["m3", "m³"]) else "t"
+        mat = material_category(line)
+        if mat:
+            des, _role = mat
+            if unit == "m³":
+                q *= 1.6
+                unit = "t"
+            grouped[(des, unit)] += q
+        elif any(k in nl for k in ["gravats", "bloc beton", "bloc béton"]):
+            if unit == "m³":
+                q *= 1.6
+                unit = "t"
+            grouped[("Déchets inertes en mélange (Gravats) - Fin de vie hors", unit)] += q
+
+    out = []
+    for (des, unit), q in grouped.items():
+        role = "dechets" if des.startswith("Déchets") else "achats_intrants"
+        out.append(make_item(filename, scope, role, des, q, unit, "haute", "extraction directe facture matériaux"))
+    if out:
+        print(f"  [DIRECT MATERIAUX] {len(out)} ligne(s)")
+    return out
+
+
+FINANCIAL_REJECTS: list[dict] = []
+
+FIN_REJECT_WORDS = [
+    "tva", "taxe", "ticpe", "remise", "avoir", "caution", "depot", "dépôt", "salaire",
+    "urssaf", "impot", "impôt", "assurance", "loyer", "amort", "emprunt", "banque populaire",
+]
+
+FIN_CATEGORIES: list[tuple[str, list[str], str]] = [
+    ("Ciment", ["ciment", "cem ", "lafarge", "eqiom", "vicat", "calcia", "cemex", "holcim"], "achats_intrants"),
+    ("Grave non traitée", ["grave", "grave 0/", "grave industrielle"], "achats_intrants"),
+    ("Granulats / sable / terre", ["sable", "granulat", "calcaire", "terre", "enrobe", "enrobé", "carriere", "carrière", "materiaux", "matériaux", "ptd", "plateforme"], "achats_intrants"),
+    ("Pavés / bordures", ["pave", "pavé", "bordure", "bordures"], "achats_intrants"),
+    ("EPI, fournitures admin. et petit matériel", ["epi", "e.p.i", "fourniture", "petit materiel", "petit matériel", "outillage", "gant", "casque", "gilet", "bureau", "cartouche"], "services"),
+    ("Location de matériel", ["location", "loxam", "kiloutou", "loueur", "locat", "engin"], "services"),
+    ("Services entretien/maintenance", ["maintenance", "entretien", "reparation", "réparation", "sav", "controle", "contrôle", "revision", "dépannage", "depannage"], "services"),
+    ("Autres services", ["honoraire", "honoraires", "abonnement", "telephonie", "téléphonie", "logiciel", "geolocalisation", "géolocalisation", "etude", "étude"], "services"),
+    ("Immobilisations", ["immobilisation", "ordinateur", "informatique", "pc", "ecran", "écran", "mobilier", "machine", "equipement", "équipement"], "immobilisations"),
+]
+
+
+def classify_financial(text: str) -> tuple[str, str] | None:
+    d = norm(text)
+    if not d or any(w in d for w in FIN_REJECT_WORDS):
+        return None
+    # ce sont des achats de services généraux, pas des intrants physiques.
+    if any(w in d for w in [
+        "assurance", "loyer", "loyers", "formation", "cadeaux clients",
+        "objet publicitaire", "objets publicitaires", "rse", "vignette crit"
+    ]):
+        return "Autres services", "services"
+
+    # Mise en décharge : les reportings déchets contiennent déjà les quantités physiques,
+    # donc on évite de compter aussi la facture en euros.
+    if any(w in d for w in ["mise en decharge", "mise en décharge", "dechets de chantiers", "déchets de chantiers"]):
+        return None
+
+    for cat, words, role in FIN_CATEGORIES:
+        if any(w in d for w in words):
+            return cat, role
+    return None
+
+
+def row_text(row: pd.Series) -> str:
+    parts = []
+    for v in row.values:
+        if v is None or pd.isna(v):
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        # garder quand même les cellules mixtes, ignorer les nombres purs
+        if not re.fullmatch(r"[-+]?\d+(?:[,.]\d+)?", s.replace(" ", "")):
+            parts.append(s)
+    return " ".join(parts)
+
+
+def amount_from_row(row: pd.Series) -> float | None:
+    vals = []
+    for v in row.values:
+        x = to_float(v)
+        if x is None:
+            continue
+        # ignorer années, comptes comptables, petites quantités
+        if 1900 <= x <= 2100 or x in {0, 1, 2, 3, 4, 5}:
+            continue
+        if 0.01 <= abs(x) <= 1_000_000:
+            vals.append(abs(x))
+    return vals[-1] if vals else None
+
+
+def _find_labeled_amount_in_recap(df: pd.DataFrame, label_keywords: list[str]) -> float | None:
+    """Trouve une valeur dans la zone de synthèse du récap achats.
+    Exemple : colonnes/cellules contenant 'autres services', 'location d\'outils', etc.
+    On lit la première valeur numérique plausible sous/près du libellé.
+    """
+    if df is None or df.empty:
+        return None
+
+    wanted = [norm(k) for k in label_keywords]
+    rows, cols = df.shape
+
+    for r in range(rows):
+        for c in range(cols):
+            cell = norm(df.iat[r, c])
+            if not cell or not any(k in cell for k in wanted):
                 continue
-            if f.lower().endswith((".py", ".pkl", ".jpg", ".jpeg", ".png")):
+
+            # Chercher dans la même colonne sur les lignes suivantes.
+            for rr in range(r + 1, min(rows, r + 8)):
+                x = to_float(df.iat[rr, c])
+                if x is not None and 10 <= x <= 1_000_000:
+                    return float(x)
+
+            # Chercher aussi à droite/gauche sur la même ligne si le tableau est aplati.
+            for cc in range(c + 1, min(cols, c + 4)):
+                x = to_float(df.iat[r, cc])
+                if x is not None and 10 <= x <= 1_000_000:
+                    return float(x)
+    return None
+
+
+def _find_total_ht_recap(df: pd.DataFrame) -> float | None:
+    """Retrouve le total HT du récap achat.
+    Dans le fichier actuel, c'est la dernière grosse valeur de la colonne Montant €.
+    """
+    if df is None or df.empty:
+        return None
+
+    amount_cols = []
+    for col in df.columns:
+        cn = norm(col)
+        if any(k in cn for k in ["montant", "ht", "euro", "€"]):
+            amount_cols.append(col)
+
+    vals: list[float] = []
+    cols_to_scan = amount_cols or list(df.columns)
+    for col in cols_to_scan:
+        for v in df[col].tolist():
+            x = to_float(v)
+            if x is not None and 1000 <= x <= 5_000_000:
+                vals.append(float(x))
+
+    if not vals:
+        return None
+    return max(vals)
+
+
+def extract_recap_achat_synthese(df: pd.DataFrame | None, filename: str, scope: str) -> list[dict]:
+    """Extraction spéciale du récap achats.
+
+    Le fichier contient à la fois :
+    - les lignes détaillées fournisseur par fournisseur ;
+    - une synthèse en colonnes : autres services, location d'outils, services entretiens ;
+    - un total HT.
+
+    Pour éviter le double comptage et reconstruire le gros poste manquant, on utilise la synthèse :
+    total HT - services - location - entretien = achats matériels non détaillés.
+    """
+    if df is None or df.empty:
+        return []
+
+    f = norm(filename)
+    if not any(k in f for k in ["recap achat", "récap achat", "achat pour bilan carbone"]):
+        return []
+
+    total_ht = _find_total_ht_recap(df)
+    autres_services = _find_labeled_amount_in_recap(df, ["autres services"])
+    location = _find_labeled_amount_in_recap(df, ["location d'outils", "location outils", "location"])
+    entretien = _find_labeled_amount_in_recap(df, ["services entretiens", "services entretien", "entretien"])
+
+    if total_ht is None or total_ht <= 0:
+        return []
+
+    # Si la synthèse n'est pas présente, on laisse l'ancien extracteur ligne par ligne agir.
+    if autres_services is None and location is None and entretien is None:
+        return []
+
+    autres_services = float(autres_services or 0)
+    location = float(location or 0)
+    entretien = float(entretien or 0)
+
+    deja_categorie = autres_services + location + entretien
+    reste_materiel = total_ht - deja_categorie
+
+    out: list[dict] = []
+    if autres_services > 0:
+        out.append(make_item(filename, scope, "services", "Autres services", autres_services, "€", "moyenne", "synthèse récap achats"))
+    if location > 0:
+        out.append(make_item(filename, scope, "services", "Location de matériel", location, "€", "moyenne", "synthèse récap achats"))
+    if entretien > 0:
+        out.append(make_item(filename, scope, "services", "Services entretien/maintenance", entretien, "€", "moyenne", "synthèse récap achats"))
+
+    # Garde-fou : le reste doit être plausible. On l'isole avec incertitude élevée.
+    if 1000 <= reste_materiel <= total_ht:
+        out.append(make_item(
+            filename, scope, "achats_intrants",
+            "Achats matériels non détaillés",
+            reste_materiel, "€", "moyenne",
+            "reste du total HT après retrait services/location/entretien"
+        ))
+
+    if out:
+        print(
+            f"  [DIRECT ACHATS SYNTHÈSE] total={total_ht:.2f} € | "
+            f"services={autres_services:.2f} € | location={location:.2f} € | "
+            f"entretien={entretien:.2f} € | matériel non détaillé={max(reste_materiel, 0):.2f} €"
+        )
+    return out
+
+
+def extract_financial(df: pd.DataFrame | None, filename: str, scope: str) -> list[dict]:
+    if df is None or df.empty:
+        return []
+    f = norm(filename)
+    if not any(k in f for k in ["recap achat", "récap achat", "achat", "facture", "immobilisation"]):
+        return []
+
+    synth = extract_recap_achat_synthese(df, filename, scope)
+    if synth:
+        return synth
+
+    grouped: dict[tuple[str, str], float] = defaultdict(float)
+    for _, row in df.iterrows():
+        txt = row_text(row)
+        amount = amount_from_row(row)
+        if amount is None or amount <= 0:
+            continue
+        cat = classify_financial(txt)
+        if cat is None:
+            if any(k in f for k in ["recap achat", "récap achat"]) and txt.strip() and txt.strip().lower() != "nan":
+                FINANCIAL_REJECTS.append({"source": filename, "libelle": txt[:300], "montant": amount, "raison": "non classé"})
+            continue
+        designation, role = cat
+        grouped[(designation, role)] += amount
+
+    out = [make_item(filename, scope, role, des, q, "€", "moyenne", "extraction financière directe")
+           for (des, role), q in grouped.items()]
+    if out:
+        print(f"  [DIRECT ACHATS] {len(out)} catégorie(s) -> {sum(x['quantite'] for x in out):.2f} €")
+    return out
+
+
+def extract_immobilisations(df: pd.DataFrame | None, filename: str, scope: str) -> list[dict]:
+    if df is None or df.empty:
+        return []
+    f = norm(filename)
+    if "immobilisation" not in f:
+        return []
+    if any(k in f for k in ["cumul par compte", "hors cessions"]):
+        print("  [SKIP IMMO] fichier agrégé ignoré pour éviter doublon")
+        return []
+
+    value_col = next((c for c in df.columns if any(k in norm(c) for k in ["valeur de l'immobilisation", "valeur de l’immobilisation", "valeur brute", "acquisition"])), None)
+    label_col = next((c for c in df.columns if any(k in norm(c) for k in ["designation", "désignation", "libelle", "libellé"])), None)
+    if value_col is None:
+        return extract_financial(df, filename, scope)
+
+    total = 0.0
+    for _, row in df.iterrows():
+        label = norm(row.get(label_col, "")) if label_col else ""
+        if any(k in label for k in ["fonds commercial", "site internet", "terrain", "droit au bail"]):
+            continue
+        v = to_float(row.get(value_col))
+        if v is not None and 10 <= v <= 100000:
+            total += v
+    if total <= 0:
+        return []
+    print(f"  [DIRECT IMMO] {total:.2f} €")
+    return [make_item(filename, scope, "immobilisations", "Immobilisations", total, "€", "moyenne", "valeur immobilisations exploitable")]
+
+
+def extract_eau(df: pd.DataFrame | None, filename: str, scope: str) -> list[dict]:
+    if df is None or df.empty:
+        return []
+
+    fn = norm(filename)
+    blob = norm(filename + " " + table_text(df, 2000))
+
+    # Attestation de contrat : pas une consommation.
+    if "attestation" in fn or "titulaire de contrat" in fn:
+        return []
+
+    # Sécurité : un fichier EDF / électricité ne doit jamais être interprété comme eau.
+    if any(k in fn for k in ["edf", "electricite", "électricité", "linky"]):
+        return []
+
+    # Dans SCOPE_2, on ne devrait trouver que l'électricité/réseau chaleur.
+    if scope == "SCOPE_2":
+        return []
+
+    if "eau" not in blob and "conso m3" not in blob and "compteur m3" not in blob:
+        return []
+
+    vals = []
+    for _, row in df.iterrows():
+        nums = []
+        for v in row.values:
+            x = to_float(v)
+            if x is None:
                 continue
-
-            filepath = os.path.join(root, f)
-            if not os.path.isfile(filepath):
+            if 1900 <= x <= 2100:
                 continue
+            if 0 < x <= 5000:
+                nums.append(x)
 
-            print(f"\n  Traitement : {f}")
-            nb_fichiers_tentes += 1
-            results = extraire_avec_groq(filepath, scope)
+        if not nums:
+            continue
 
-            if results:
-                print(f"  -> {len(results)} valeur(s) extraite(s) :")
-                for r in results:
-                    print(f"     {r['designation'][:40]:<40} | {r['quantite']:>10.2f} {r['unite']:<8} | {r['fiabilite']}")
-                final_data.extend(results)
-            else:
-                print("  -> Aucune donnée extraite")
-                non_traites.append(f)
+        vals.append(min(nums))
 
-    print(f"\n{'=' * 70}")
-    print("POST-TRAITEMENT")
-    print(f"{'=' * 70}")
-    print(f"  Données brutes : {len(final_data)}")
+    if not vals:
+        return []
 
-    seen: set[tuple] = set()
-    dedup_primary: list[dict] = []
-    for d in final_data:
-        key = (d["source"], d["designation"], round(d["quantite"], 2), d["unite"].lower())
-        if key not in seen:
-            seen.add(key)
-            dedup_primary.append(d)
-    _fiab_rank = {"haute": 2, "moyenne": 1, "faible": 0}
-    seen2: dict[tuple, dict] = {}
-    for d in dedup_primary:
-        key2 = (d["designation"], round(d["quantite"], 2), d["unite"].lower())
-        if key2 not in seen2:
-            seen2[key2] = d
+    total = sum(vals)
+    if total > 10000:
+        print(f"  [SKIP EAU] {total:.2f} m³ suspect")
+        return []
+
+    print(f"  [DIRECT EAU] {total:.2f} m³")
+    return [make_item(filename, scope, "eau", "Eau potable", total, "m³", "haute", "somme consommations m3")]
+
+
+def extract_papier(df: pd.DataFrame | None, filename: str, scope: str) -> list[dict]:
+    """
+    Extraction papier sécurisée.
+    On traite uniquement les tableaux récapitulatifs papier.
+    Les factures longues contiennent trop de numéros/montants/SIRET et sont ignorées
+    pour éviter les valeurs absurdes.
+    """
+    if df is None or df.empty:
+        return []
+
+    fn = norm(filename)
+    blob = norm(filename + " " + table_text(df, 2000))
+
+    if "factures achat papier" in fn or "facture achat papier" in fn:
+        print("  [SKIP PAPIER] facture papier non structurée ignorée")
+        return []
+
+    if not any(k in blob for k in ["tableau recap achat papier", "tableau récap achat papier", "a4", "a3", "traceur"]):
+        return []
+
+    a4 = a3 = rolls = 0.0
+
+    for _, row in df.iterrows():
+        txt = norm(" ".join(str(v) for v in row.values))
+        nums = []
+        for v in row.values:
+            x = to_float(v)
+            if x is None:
+                continue
+            # Exclure années, dates et montants très grands.
+            if 1900 <= x <= 2100:
+                continue
+            if 0 < x <= 500000:
+                nums.append(x)
+
+        if not nums:
+            continue
+
+        # Pour les tableaux récap papier, la dernière/grande valeur de la ligne est souvent le total.
+        q = max(nums)
+
+        if "a4" in txt:
+            a4 += q
+        elif "a3" in txt:
+            a3 += q
+        elif "traceur" in txt or "rouleau" in txt:
+            rolls += q
+
+    kg = a4 * 0.002 + a3 * 0.004 + rolls * 0.7
+
+    # Garde-fou : une PME ne doit pas remonter des tonnes de papier par erreur.
+    if kg <= 0:
+        return []
+    if kg > 10000:
+        print(f"  [SKIP PAPIER] {kg:.2f} kg suspect")
+        return []
+
+    print(f"  [DIRECT PAPIER] {kg:.2f} kg")
+    return [make_item(filename, scope, "papier", "Papier", kg, "kg", "haute", "conversion feuilles/rouleaux en kg")]
+
+def audit_status(item: dict) -> tuple[str, str]:
+    unit = norm(item.get("unite", ""))
+    q = float(item.get("quantite", 0) or 0)
+    des = norm(item.get("designation", ""))
+    if q <= 0:
+        return "SUSPECT", "quantité nulle"
+    if "eau" in des and unit in {"m3", "m³"} and q > 10000:
+        return "SUSPECT", "eau > 10 000 m3"
+    if "papier" in des and unit == "kg" and q > 10000:
+        return "SUSPECT", "papier > 10 000 kg"
+    if "propane" in des and unit == "kg" and q > 10000:
+        return "SUSPECT", "propane > 10 000 kg"
+    if "gravats" in des and unit == "t" and q > 10000:
+        return "SUSPECT", "déchets inertes > 10 000 t"
+    if unit in {"€", "eur", "euro", "euros"}:
+        return "A_VERIFIER", "montant financier à contrôler"
+    return "OK", ""
+
+
+def write_audit(base_path: str, data: list[dict], no_data: list[str], nb_files: int) -> None:
+    rows = []
+    for item in data:
+        st, alert = audit_status(item)
+        rows.append({**item, "statut": st, "alerte": alert})
+    for f in no_data:
+        rows.append({"source": f, "scope": "", "role": "", "designation": "", "quantite": "", "unite": "", "fiabilite": "", "justification": "", "est_calcule": False, "statut": "AUCUNE_DONNEE", "alerte": "aucune donnée extraite"})
+
+    fields = ["statut", "alerte", "source", "scope", "role", "designation", "quantite", "unite", "fiabilite", "justification", "est_calcule"]
+    out_csv = os.path.join(base_path, "audit_extraction_bilan_carbone.csv")
+    with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=fields, delimiter=";")
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: row.get(k, "") for k in fields})
+
+    summary = {
+        "version": VERSION,
+        "nb_fichiers_tentes": nb_files,
+        "nb_donnees": len(data),
+        "nb_sans_donnees": len(no_data),
+        "nb_ok": sum(1 for r in rows if r.get("statut") == "OK"),
+        "nb_a_verifier": sum(1 for r in rows if r.get("statut") == "A_VERIFIER"),
+        "nb_suspect": sum(1 for r in rows if r.get("statut") == "SUSPECT"),
+        "audit_csv": out_csv,
+    }
+    out_json = os.path.join(base_path, "audit_extraction_bilan_carbone_resume.json")
+    Path(out_json).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if FINANCIAL_REJECTS:
+        out_rej = os.path.join(base_path, "audit_rejets_financiers_non_classes.csv")
+        with open(out_rej, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=["source", "libelle", "montant", "raison"], delimiter=";")
+            w.writeheader()
+            w.writerows(FINANCIAL_REJECTS)
+        print(f"  [AUDIT] Rejets financiers : {out_rej}")
+    print(f"  [AUDIT] CSV : {out_csv}")
+
+
+def deduplicate(data: list[dict]) -> list[dict]:
+    merged: dict[tuple, dict] = {}
+    for d in data:
+        unit = str(d.get("unite", ""))
+        # Fusionner les montants financiers par poste et scope ; garder les unités physiques par source.
+        if unit == "€":
+            key = (d["scope"], d.get("role", ""), d["designation"], unit)
         else:
-            # Garder la version la plus fiable
-            existing_rank = _fiab_rank.get(seen2[key2].get("fiabilite", "faible"), 0)
-            new_rank      = _fiab_rank.get(d.get("fiabilite", "faible"), 0)
-            if new_rank > existing_rank:
-                seen2[key2] = d
-    dedup = list(seen2.values())
+            key = (d["source"], d["scope"], d["designation"], unit)
+        if key in merged:
+            merged[key]["quantite"] = round(float(merged[key]["quantite"]) + float(d["quantite"]), 4)
+            if d["source"] not in merged[key]["source"]:
+                merged[key]["source"] += " + " + d["source"]
+        else:
+            merged[key] = dict(d)
+    return list(merged.values())
 
-    nb_doublons = len(final_data) - len(dedup)
-    if nb_doublons:
-        print(f"  {nb_doublons} doublon(s) supprimé(s)")
 
-    print(f"\n{'=' * 70}")
-    print("RÉSUMÉ FINAL")
-    print(f"{'=' * 70}")
-    print(f"Total valeurs extraites : {len(dedup)}")
-    print(f"Requêtes Groq utilisées : {_req_jour}/{LIMITE_RPD}")
+def extract_one(path: str, scope: str) -> list[dict]:
+    filename = Path(path).name
+    raw_text = read_text(path) if Path(path).suffix.lower() == ".txt" else ""
+    df = load_table(path)
+    role = detect_role(filename, df, raw_text)
 
-    if non_traites:
-        print(f"\nFichiers sans données ({len(non_traites)}) :")
-        for f in non_traites:
-            print(f"  - {f}")
+    # Priorité aux extracteurs très fiables.
+    for extractor in (
+        lambda: extract_propane(path, filename, scope),
+        lambda: extract_vehicules(path, filename, scope),
+        lambda: extract_edf(path, filename, scope, df),
+        lambda: extract_immobilisations(df, filename, scope),
+        lambda: extract_dechets(path, filename, scope, df),
+        lambda: extract_ptd_materials(path, filename, scope),
+        lambda: extract_financial(df, filename, scope),
+        lambda: extract_papier(df, filename, scope),
+        lambda: extract_eau(df, filename, scope),
+    ):
+        res = extractor()
+        if res:
+            return res
 
+    if role == "general":
+        print("  [SKIP] rôle non reconnu, Groq désactivé par défaut")
+    else:
+        print(f"  [SKIP] aucun extracteur direct concluant ({role})")
+    return []
+
+
+def iter_scope_files(base_path: str):
     for scope in ("SCOPE_1", "SCOPE_2", "SCOPE_3"):
-        scope_data = [d for d in dedup if d["scope"] == scope]
-        if scope_data:
-            print(f"\n  [{scope}] {len(scope_data)} valeur(s) :")
-            for d in scope_data:
-                print(
-                    f"    {d['source'][:30]:<30} | {d['designation'][:30]:<30} "
-                    f"| {d['quantite']:>10.2f} {d['unite']:<8} | {d['fiabilite']}"
-                )
+        folder = Path(base_path) / scope
+        if not folder.exists():
+            continue
+        for p in sorted(folder.iterdir()):
+            if p.is_file() and p.suffix.lower() in {".csv", ".txt", ".xlsx", ".xls", ".xlsm"}:
+                yield scope, str(p)
 
-    print(f"\n{'=' * 70}")
-    return dedup, nb_fichiers_tentes
+
+def lancer_le_bilan(base_path: str = ".") -> tuple[list[dict], int]:
+    print("=" * 70)
+    print(VERSION)
+    print("Groq : désactivé par défaut, extraction directe Python")
+    print("=" * 70)
+
+    all_data: list[dict] = []
+    no_data: list[str] = []
+    tried = 0
+
+    current_scope = None
+    for scope, path in iter_scope_files(base_path):
+        if current_scope != scope:
+            current_scope = scope
+            print(f"\n{'─' * 70}\nDossier : {scope}\n{'─' * 70}")
+        filename = Path(path).name
+        if is_non_source(filename):
+            print(f"  [SKIP] {filename} → exclu/non source")
+            continue
+        tried += 1
+        print(f"\n  Traitement : {filename}")
+        try:
+            res = extract_one(path, scope)
+        except Exception as e:
+            print(f"  [ERREUR] {filename}: {e}")
+            res = []
+        if res:
+            all_data.extend(res)
+            print(f"  → {len(res)} valeur(s) :")
+            for r in res:
+                print(f"     {r['designation'][:42]:42s} | {r['quantite']:>10} {r['unite']:<8} | {r['fiabilite']}")
+        else:
+            no_data.append(filename)
+            print("  → Aucune donnée")
+
+    dedup = deduplicate(all_data)
+    removed = len(all_data) - len(dedup)
+    print("\n" + "=" * 70)
+    print(f"POST-TRAITEMENT — {len(all_data)} valeurs brutes")
+    if removed:
+        print(f"  {removed} doublon(s) fusionné(s)")
+
+    print("\n" + "=" * 70)
+    print(f"RÉSUMÉ FINAL — {len(dedup)} valeurs | {tried} fichier(s) tenté(s)")
+    for scope in ("SCOPE_1", "SCOPE_2", "SCOPE_3"):
+        items = [d for d in dedup if d.get("scope") == scope]
+        if not items:
+            continue
+        print(f"\n  [{scope}] {len(items)} valeur(s) :")
+        for d in items:
+            print(f"    {d['source'][:28]:28s} | {d['designation'][:32]:32s} | {d['quantite']:>10} {d['unite']:<8} | {d.get('role','')}")
+
+    if no_data:
+        print(f"\nFichiers sans données ({len(no_data)}) :")
+        for f in no_data[:30]:
+            print(f"  - {f}")
+        if len(no_data) > 30:
+            print(f"  ... {len(no_data) - 30} autre(s)")
+
+    write_audit(base_path, dedup, no_data, tried)
+    print("=" * 70)
+    return dedup, tried
+
+
+if __name__ == "__main__":
+    lancer_le_bilan(".")

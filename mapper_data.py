@@ -1,172 +1,231 @@
 import os
+import re
+import shutil
 import unicodedata
 import numpy as np
 import pandas as pd
-import pymupdf
-from PIL import Image
-from docx import Document
-import shutil
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine_similarity
+from sklearn.metrics.pairwise import cosine_similarity
 
-model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+model = SentenceTransformer(MODEL_NAME)
 
 SCOPES_THEMES = {
     "SCOPE_1": [
-        "Facture de gaz naturel",
-        "Bouteille de gaz propane butane pour usage domestique ou professionnel",
-        "Achat de carburant gazole fioul diesel pour flotte de véhicules de l'entreprise",
-        "Consommation essence sans plomb pour véhicules de service",
-        "Recharge de gaz propane butane en citerne ou bouteille",
-        "Remplissage cuve fioul domestique chauffage",
-        "Relevé de consommation fioul lourd ou GNR engins de chantier",
+        "Liste des véhicules de société avec consommation carburant annuelle en litres gazole diesel GNR",
+        "Consommation carburant flotte véhicules utilitaires camions engins litres",
+        "Facture carburant gazole diesel fioul véhicules et engins entreprise",
+        "Facture de gaz naturel chaudière chauffage bâtiment consommation kWh PCI m3",
+        "Bouteille gaz propane butane Antargaz Primagaz usage professionnel cuisson chauffage",
+        "Remplissage cuve fioul domestique litres chauffage",
+        "Relevé consommation GNR gazole non routier engins de chantier travaux",
+        "Fuite fluides frigorigènes climatisation R410a gaz réfrigérant",
     ],
     "SCOPE_2": [
-        "Facture d'électricité EDF, abonnement et consommation en kWh",
-        "Relevé de compteur électrique Linky",
-        "Consommation électrique des bâtiments, électricité réseau",
-        "Consommation réseau de chaleur urbain ou réseau de froid"
+        "Facture EDF électricité consommation kWh puissance souscrite index heures pleines heures creuses",
+        "Statistiques consommation électrique annuelle bâtiment tertiaire kWh",
+        "Relevé compteur électrique Linky consommation mensuelle kWh",
+        "Tableau de bord consommation énergétique électricité bâtiment exercice annuel",
+        "Consommation réseau de chaleur urbain vapeur MWh abonnement",
     ],
     "SCOPE_3": [
-        "Transport de marchandises, logistique, fret routier maritime aérien",
-        "Facture de livraison prestataire externe camion poids lourd",
-        "Gestion des déchets, ordures ménagères, DEEE, recyclage papier carton",
-        "Déplacements professionnels, billets de train SNCF TGV, avion",
-        "Notes de frais, indemnités kilométriques IK, déplacements collaborateurs",
-        "Trajets domicile travail des salariés, abonnement transports en commun",
-        "Achat de fournitures de bureau, papier, cartouches d'encre, matériel informatique",
-        "Facture d'eau potable, consommation en m3 ou litres",
-        "Achat de matières premières, intrants, composants industriels",
-        "Prestations de services, honoraires, frais bancaires, assurances"
-        "Déchets , papier, carton, matières, DEEE, recyclage, béton, gravats, ordures ménagères",
-    ]
+        "Kilométrage annuel conducteurs véhicules relevé odomètre tableau récapitulatif",
+        "Déplacements professionnels billets train SNCF TGV avion notes de frais",
+        "Indemnités kilométriques déplacements domicile travail salariés",
+        "Tableau suivi déchets entreprise papier carton plastique métal D3E DEEE tri sélectif",
+        "Bordereau suivi déchets dangereux DIS produits chimiques entreprise bureau",
+        "Factures collecte déchets entreprise papier carton DEEE recyclage",
+        "Achat fournitures de bureau papier cartouches encre matériel informatique",
+        "Facture eau potable consommation m3 litres abonnement réseau",
+        "Récapitulatif achats biens et services fournitures année",
+        "Liste immobilisations état amortissement matériel équipement véhicules",
+        "Bordereau de suivi déchets BSD collecte matériaux chantier gravats terres client BTP",
+        "Tableau récapitulatif collectes déchets inertes béton sable calcaire client BTP",
+        "Fiche de données de sécurité FDS matériaux chantier travaux publics client",
+    ],
 }
 
-# 2. PRÉCALCUL DES VECTEURS INDIVIDUELS
+USELESS_KEYWORDS = [
+    "export - beges", "export - iso", "export - ghg", "export - occf",
+    "export boites", "export sous-postes", "export donnees utilisees",
+    "export données utilisées", "futurs exports", "matrice de collecte",
+    "ratios", "objectif", "reduction", "réduction",
+    "q18", "rapport de verification", "rapport de vérification",
+    "diagnostic", "diagnostics", "fds", "fiche de donnees de securite",
+    "fiche de données de sécurité", "plan des bureaux",
+    "rgpd", "violation", "soc_abs", "soc_pdf",
+]
 
-
-def normalize_text(text):
+def normalize_text(text: str) -> str:
     if text is None:
         return ""
     text = unicodedata.normalize("NFD", str(text).lower())
-    return "".join(c for c in text if unicodedata.category(c) != "Mn")
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
+def classify_by_rules(filename: str, text: str) -> str | None:
+    fn = normalize_text(filename)
+    tx = normalize_text(text[:2500])
+    blob = f"{fn} {tx}"
 
-reference_vectors = []
-reference_scopes = []
+    if any(normalize_text(k) in blob for k in USELESS_KEYWORDS):
+        return "USELESS"
+
+    # Scope 2 d'abord : électricité achetée
+    if any(k in blob for k in [
+        "edf", "electricite", "linky", "consommation facturee",
+        "kwh", "heures pleines", "heures creuses"
+    ]):
+        if any(k in blob for k in ["rapport", "verification", "q18", "installation electrique"]):
+            return "USELESS"
+        return "SCOPE_2"
+
+    # Scope 1 : carburant / gaz / combustion directe
+    if any(k in blob for k in [
+        "consommation de carburant", "gazole", "diesel", "gnr", "fioul",
+        "carburant (l)", "litres carburant", "liste des vehicules",
+        "bouteille de gaz", "antargaz", "primagaz", "propane", "butane", "gaz naturel"
+    ]):
+        return "SCOPE_1"
+
+    # Scope 3 : déchets, achats, papier, eau, déplacements
+    if any(k in blob for k in [
+        "dechet", "dechets", "gravats", "dib", "bois b", "bois a",
+        "papier", "a4", "a3", "traceur", "rouleau",
+        "eau", "facture eau", "consommation eau",
+        "km annuel", "kilometrage", "domicile travail",
+        "achat", "fournitures", "materiel informatique", "immobilisation"
+    ]):
+        return "SCOPE_3"
+
+    return None
+
+ref_vectors: list[np.ndarray] = []
+ref_scopes: list[str] = []
 for scope, phrases in SCOPES_THEMES.items():
     for phrase in phrases:
-        reference_vectors.append(model.encode(normalize_text(phrase)))
-        reference_scopes.append(scope)
+        ref_vectors.append(model.encode(normalize_text(phrase)))
+        ref_scopes.append(scope)
+REF_MATRIX = np.array(ref_vectors)
+REF_SCOPES = np.array(ref_scopes)
 
-# Convertir en matrice numpy pour opérations vectorisées
-reference_vectors = np.array(reference_vectors)
-reference_scopes = np.array(reference_scopes)
-
-def extract_text(path): 
-    ext = path.lower().split(".")[-1]
+def extract_text(path: str, max_chars: int = 1500) -> str:
+    ext = path.lower().rsplit(".", 1)[-1]
     try:
         if ext == "txt":
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read(300)
-
+            for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+                try:
+                    with open(path, encoding=enc) as f:
+                        return f.read(max_chars)
+                except UnicodeDecodeError:
+                    continue
         elif ext == "csv":
-            df = pd.read_csv(path, sep=None, engine="python", encoding="latin1", on_bad_lines='skip', nrows=50)
-            content = df.fillna('').astype(str).values.flatten()
-            return " ".join([item for item in content if item.strip()])
-
-        elif ext in ["xls", "xlsx", "xlsm"]:
+            df = pd.read_csv(path, sep=None, engine="python", encoding="latin1", on_bad_lines="skip", nrows=50)
+            tokens = df.fillna("").astype(str).values.flatten()
+            return " ".join(t for t in tokens if t.strip())[:max_chars]
+        elif ext in ("xls", "xlsx", "xlsm"):
             df = pd.read_excel(path, nrows=50)
-            content = df.fillna('').astype(str).values.flatten()
-            return " ".join([item for item in content if item.strip()])
-
+            tokens = df.fillna("").astype(str).values.flatten()
+            return " ".join(t for t in tokens if t.strip())[:max_chars]
         elif ext == "docx":
+            from docx import Document
             doc = Document(path)
-            return "\n".join([p.text for p in doc.paragraphs])
-
+            return "\n".join(p.text for p in doc.paragraphs)[:max_chars]
         elif ext == "pdf":
+            import pymupdf
             doc = pymupdf.open(path)
-            text = ""
-            for page in doc:
-                text += page.get_text("text")
-            return text
-        else:
-            return ""
+            return "".join(page.get_text("text") for page in doc)[:max_chars]
     except Exception as e:
-        print("Erreur extraction:", path, e)
-        return ""
+        print(f"  [ERREUR EXTRACT] {path}: {e}")
+    return ""
 
-def run_test(folder="cleaned_files", threshold=0.30): 
-    results = {}
-    rejected_files = []  # Tracker les fichiers rejetés
-    
+def run_test(folder: str = "cleaned_files", threshold: float = 0.40) -> dict[str, str]:
+    results: dict[str, str] = {}
     if not os.path.exists(folder):
-        print(f"Dossier {folder} introuvable.")
+        print(f"[ERREUR] Dossier introuvable : {folder}")
         return results
 
-    # 1. Extraction + normalisation de tous les textes
-    files_to_classify = []
-    for file in sorted(os.listdir(folder)):  # tri pour reproductibilité
-        path = os.path.join(folder, file)
-        if not os.path.isfile(path):
+    files = sorted(f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f)))
+    if not files:
+        return results
+
+    print(f"\nClassification de {len(files)} fichier(s) (seuil={threshold})...\n")
+    texts: list[tuple[str, str]] = []
+
+    for fname in files:
+        text = extract_text(os.path.join(folder, fname))
+        rule_scope = classify_by_rules(fname, text)
+        if rule_scope:
+            results[fname] = rule_scope
+            icon = "✓" if rule_scope != "USELESS" else "✗"
+            print(f"  {icon} {fname:<55} règle métier → {rule_scope}")
             continue
-
-        text = extract_text(path)
         if text and len(text.strip()) >= 20:
-            files_to_classify.append((file, text))
+            texts.append((fname, text))
+        else:
+            results[fname] = "USELESS"
+            print(f"  ✗ {fname:<55} vide/illisible → USELESS")
 
-    if not files_to_classify:
-        return results
+    if texts:
+        norms = [normalize_text(t) for _, t in texts]
+        vecs = model.encode(norms, batch_size=32, convert_to_numpy=True)
+        sims = cosine_similarity(vecs, REF_MATRIX)
+        for i, (fname, _) in enumerate(texts):
+            best_idx = int(np.argmax(sims[i]))
+            best_score = float(sims[i][best_idx])
+            best_scope = REF_SCOPES[best_idx]
+            if best_score < threshold:
+                best_scope = "USELESS"
+            icon = "✓" if best_scope != "USELESS" else "✗"
+            print(f"  {icon} {fname:<55} score={best_score:.3f} → {best_scope}")
+            results[fname] = best_scope
 
-    print(f"\n Classification {len(files_to_classify)} fichier(s)...")
-    print(f"   Seuil de confiance : {threshold}\n")
-    
-    # 2. Batch encoding : traiter tous les textes en une fois
-    texts_normalized = [normalize_text(text) for _, text in files_to_classify]
-    vectors = model.encode(texts_normalized, batch_size=32, convert_to_numpy=True)
-
-    # 3. Classification vectorisée
-    similarities = sklearn_cosine_similarity(vectors, reference_vectors)
-    
-    for i, (file, _) in enumerate(files_to_classify):
-        # Meilleur score et scope pour ce fichier
-        best_idx = np.argmax(similarities[i])
-        best_score = similarities[i][best_idx]
-        best_scope = reference_scopes[best_idx]
-        
-        if best_score < threshold:
-            best_scope = "USELESS"
-            rejected_files.append((file, best_score, reference_scopes[best_idx]))
-        
-        status = "" if best_score >= threshold else ""
-        print(f"  {status} {file:<50} score={best_score:.3f} -> {best_scope}")
-        results[file] = best_scope
-
-    # Afficher un résumé des fichiers rejetés
-    if rejected_files:
-        print(f"\n  {len(rejected_files)} fichier(s) rejeté(s) (score < {threshold}) :")
-        for file, score, scope in sorted(rejected_files, key=lambda x: x[1], reverse=True):
-            print(f"     • {file:<50} score={score:.3f} (proche de {scope})")
-
+    print()
+    for scope in ("SCOPE_1", "SCOPE_2", "SCOPE_3", "USELESS"):
+        n = sum(1 for v in results.values() if v == scope)
+        if n:
+            print(f"  {scope:<10} : {n} fichier(s)")
     return results
 
-def export_per_scope(results, source_folder="cleaned_files", dest_base="."):
-    for file_name, scope in results.items():
-        if scope in ["SCOPE_1", "SCOPE_2", "SCOPE_3"]:
-            scope_dir = os.path.join(dest_base, scope)  
-            if not os.path.exists(scope_dir):
-                os.makedirs(scope_dir)
-            src_path = os.path.join(source_folder, file_name)
-            dst_path = os.path.join(scope_dir, file_name)
+def clear_scope_dirs(dest_base: str = ".") -> None:
+    for scope in ("SCOPE_1", "SCOPE_2", "SCOPE_3"):
+        dest_dir = os.path.join(dest_base, scope)
+        os.makedirs(dest_dir, exist_ok=True)
+        for name in os.listdir(dest_dir):
+            path = os.path.join(dest_dir, name)
             try:
-                shutil.copy(src_path, dst_path)
-                print(f"Copié : {file_name} -> {scope_dir}/")
+                if os.path.isfile(path) or os.path.islink(path):
+                    os.remove(path)
+                elif os.path.isdir(path):
+                    shutil.rmtree(path)
             except Exception as e:
-                print(f"Erreur lors de la copie de {file_name}: {e}")
+                print(f"  [WARN CLEAN] Impossible de supprimer {path}: {e}")
+
+def export_per_scope(results: dict[str, str], source_folder: str = "cleaned_files", dest_base: str = ".", clean_before_export: bool = True) -> None:
+    if clean_before_export:
+        print("\nNettoyage des anciens dossiers SCOPE...")
+        clear_scope_dirs(dest_base)
+    for fname, scope in results.items():
+        if scope not in ("SCOPE_1", "SCOPE_2", "SCOPE_3"):
+            continue
+        dest_dir = os.path.join(dest_base, scope)
+        os.makedirs(dest_dir, exist_ok=True)
+        src = os.path.join(source_folder, fname)
+        dst = os.path.join(dest_dir, fname)
+        try:
+            shutil.copy2(src, dst)
+            print(f"  Copié : {fname} → {scope}/")
+        except Exception as e:
+            print(f"  [ERREUR COPIE] {fname}: {e}")
 
 if __name__ == "__main__":
-    results = run_test(threshold=0.30)
-    export_per_scope(results)
-    print("\ RÉSULTATS FINAUX")
-    for k, v in results.items():
-        print(k, ":", v)
+    results = run_test(threshold=0.40)
+    export_per_scope(results, clean_before_export=True)
+    print("\nRÉSULTATS FINAUX")
+    for scope in ("SCOPE_1", "SCOPE_2", "SCOPE_3"):
+        fichiers = [k for k, v in results.items() if v == scope]
+        if fichiers:
+            print(f"\n  {scope} ({len(fichiers)}) :")
+            for f in fichiers:
+                print(f"    • {f}")

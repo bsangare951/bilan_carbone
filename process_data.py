@@ -18,6 +18,7 @@ def charger_et_nettoyer(dossier_source):
     
     cleaned = clean_excel(datas)
     cleaned = clean_PDF(cleaned)
+    cleaned = clean_TXT(cleaned)   # ← nouveau : nettoyage TXT avant CSV
     cleaned = clean_CSV(cleaned)
     cleaned = clean_DOCX(cleaned)
     cleaned = clean_JPEG(cleaned)
@@ -147,6 +148,117 @@ def clean_PDF(datas):
     return cleaned_datas
 
 
+
+def clean_TXT(datas):
+    """Nettoie et normalise les fichiers TXT.
+    
+    Problème connu : load_data charge parfois les TXT ligne par ligne,
+    ce qui casse les tableaux exportés depuis Excel (chaque cellule
+    devient une ligne séparée). Ce nettoyage :
+    - Joint les lignes trop courtes qui semblent être des fragments
+    - Supprime les lignes vides consécutives
+    - Préserve la structure des tableaux numériques
+    """
+    output_dir = "cleaned_files"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    cleaned_datas = {}
+
+    for filename, content in datas.items():
+        f_type = str(content.get("type", "")).lower()
+
+        if f_type != "txt":
+            cleaned_datas[filename] = content
+            continue
+        if filename.startswith("cleaned_"):
+            cleaned_datas[filename] = content
+            continue
+
+        try:
+            raw_text = content.get("text", "") or content.get("content", "")
+
+            if not raw_text:
+                # Fallback : essayer de lire le fichier directement
+                for enc in ("utf-8", "utf-8-sig", "latin-1"):
+                    try:
+                        with open(filename, "r", encoding=enc) as f:
+                            raw_text = f.read()
+                        break
+                    except Exception:
+                        continue
+
+            if not raw_text:
+                print(f"[WARN] TXT vide : {filename}")
+                cleaned_datas[filename] = content
+                continue
+
+            lines = raw_text.splitlines()
+
+            non_empty = [l for l in lines if l.strip()]
+            short_lines = [l for l in non_empty if len(l.strip()) <= 15]
+            is_fragmented = len(non_empty) > 10 and len(short_lines) / len(non_empty) > 0.5
+
+            if is_fragmented:
+                rebuilt = []
+                buffer = []
+                for line in lines:
+                    stripped = line.strip()
+                    if not stripped:
+                        if buffer:
+                            rebuilt.append(" ".join(buffer))
+                            buffer = []
+                        continue
+                    has_number = bool(re.search(r'\d{2,}', stripped))
+                    is_long = len(stripped) > 20
+                    if has_number or is_long:
+                        if buffer:
+                            rebuilt.append(" | ".join(buffer + [stripped]))
+                            buffer = []
+                        else:
+                            rebuilt.append(stripped)
+                    else:
+                        buffer.append(stripped)
+                if buffer:
+                    rebuilt.append(" ".join(buffer))
+                cleaned_text = "\n".join(rebuilt)
+                print(f"  [TXT] Fichier fragmenté reconstruit : {filename} "
+                      f"({len(lines)} lignes -> {len(rebuilt)} lignes)")
+            else:
+                # Nettoyage standard
+                cleaned_lines = []
+                for line in lines:
+                    line = line.replace("\r", "").strip()
+                    # Supprimer les lignes de séparateurs purs
+                    if re.match(r'^[-=_*]{3,}$', line):
+                        continue
+                    cleaned_lines.append(line)
+                # Supprimer les sauts de ligne multiples
+                cleaned_text = re.sub(r'\n{3,}', '\n\n', "\n".join(cleaned_lines))
+
+            # Nettoyage commun
+            cleaned_text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned_text)
+            cleaned_text = re.sub(r' {3,}', '  ', cleaned_text)
+            cleaned_text = cleaned_text.strip()
+
+            clean_filename = f"cleaned_{filename}"
+            save_path = os.path.join(output_dir, clean_filename)
+            with open(save_path, "w", encoding="utf-8") as f:
+                f.write(cleaned_text)
+
+            cleaned_datas[filename] = {
+                "type": "txt",
+                "text": cleaned_text,
+            }
+            print(f"[OK] TXT '{filename}' nettoyé : {save_path}")
+
+        except Exception as e:
+            print(f"[ERREUR] TXT {filename} : {e}")
+            cleaned_datas[filename] = content
+
+    return cleaned_datas
+
+
 def clean_CSV(datas):
     output_dir = "cleaned_files"
     if not os.path.exists(output_dir):
@@ -249,4 +361,3 @@ def clean_JPEG(datas):
                 print(f"[ERREUR] {filename} : {e}")
 
     return datas
-
