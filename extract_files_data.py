@@ -11,9 +11,16 @@ from typing import Any
 
 import pandas as pd
 
-VERSION = "BILAN CARBONE — Extraction V21 ACHATS CONSÉQUENTS"
+VERSION = "BILAN CARBONE — Extraction/Calcul"
+
 
 _req_jour = 0
+_groq_verify_calls = 0
+USE_GROQ_VERIFICATION = os.getenv("USE_GROQ_VERIFICATION", "1").strip().lower() not in {"0", "false", "non", "no", "off"}
+GROQ_VERIFY_MODEL = os.getenv("GROQ_VERIFY_MODEL", "llama-3.1-8b-instant")
+GROQ_VERIFY_MAX_CALLS = int(os.getenv("GROQ_VERIFY_MAX_CALLS", "8"))
+GROQ_VERIFY_CONTEXT_CHARS = int(os.getenv("GROQ_VERIFY_CONTEXT_CHARS", "5000"))
+
 
 SKIP_KEYWORDS = [
     ".~lock", "~$", "_in", "fe energie", "fe énergie", "fe fret", "fe dechets",
@@ -151,6 +158,10 @@ def make_item(source: str, scope: str, role: str, designation: str, quantite: fl
         "est_calcule": False,
     }
 
+# ---------------------------------------------------------------------------
+# Détection de rôle
+# ---------------------------------------------------------------------------
+
 
 def detect_role(filename: str, df: pd.DataFrame | None, raw_text: str) -> str:
     f = norm(filename)
@@ -172,6 +183,10 @@ def detect_role(filename: str, df: pd.DataFrame | None, raw_text: str) -> str:
     if any(k in blob for k in ["eau", "compteur m3", "conso m3", "franciliane"]):
         return "eau"
     return "general"
+
+# ---------------------------------------------------------------------------
+# Extracteurs directs
+# ---------------------------------------------------------------------------
 
 
 def extract_propane(path: str, filename: str, scope: str) -> list[dict]:
@@ -314,6 +329,7 @@ def extract_edf(path: str, filename: str, scope: str, df: pd.DataFrame | None) -
                 if vals:
                     candidates.append(max(vals))
 
+
     fn = norm(filename)
     if not candidates and "stats conso edf 2024" in fn:
         candidates.append(65880.0)
@@ -400,6 +416,8 @@ def extract_ptd_materials(path: str, filename: str, scope: str) -> list[dict]:
         return []
 
     fn = norm(filename)
+    # Très important : les reportings déchets doivent passer par extract_dechets,
+    # jamais par l'extracteur "factures matériaux", sinon les quantités explosent.
     if any(k in fn for k in ["reporting dechets", "reporting déchets", "tableau recap dechets", "tableau récap déchets"]):
         return []
 
@@ -465,6 +483,8 @@ def classify_financial(text: str) -> tuple[str, str] | None:
     d = norm(text)
     if not d or any(w in d for w in FIN_REJECT_WORDS):
         return None
+
+    # Catégories apparues dans l'audit V19 :
     # ce sont des achats de services généraux, pas des intrants physiques.
     if any(w in d for w in [
         "assurance", "loyer", "loyers", "formation", "cadeaux clients",
@@ -638,6 +658,9 @@ def extract_financial(df: pd.DataFrame | None, filename: str, scope: str) -> lis
     if not any(k in f for k in ["recap achat", "récap achat", "achat", "facture", "immobilisation"]):
         return []
 
+    # Cas prioritaire : récap achats avec synthèse + total HT.
+    # On utilise cette structure plutôt que les lignes détaillées pour éviter les doublons
+    # et faire ressortir les achats matériels non détaillés.
     synth = extract_recap_achat_synthese(df, filename, scope)
     if synth:
         return synth
@@ -729,6 +752,7 @@ def extract_eau(df: pd.DataFrame | None, filename: str, scope: str) -> list[dict
         if not nums:
             continue
 
+        # Dans cleaned_eau_eau.csv, la consommation est généralement la plus petite valeur utile de la ligne.
         vals.append(min(nums))
 
     if not vals:
@@ -803,6 +827,351 @@ def extract_papier(df: pd.DataFrame | None, filename: str, scope: str) -> list[d
     print(f"  [DIRECT PAPIER] {kg:.2f} kg")
     return [make_item(filename, scope, "papier", "Papier", kg, "kg", "haute", "conversion feuilles/rouleaux en kg")]
 
+
+# ---------------------------------------------------------------------------
+# Vérification de cohérence Python + Groq ciblé
+# ---------------------------------------------------------------------------
+
+def _unit_norm(value: Any) -> str:
+    u = str(value or "").strip()
+    return u.replace("m3", "m³").replace("M3", "m³")
+
+
+def _plausible_quantity(designation: str, quantite: float, unite: str) -> bool:
+    d = norm(designation)
+    u = _unit_norm(unite)
+
+    if quantite <= 0:
+        return False
+
+    # Seuils volontairement larges : on bloque seulement les valeurs clairement absurdes.
+    if u == "€":
+        return quantite <= 5_000_000
+    if "papier" in d and u == "kg":
+        return quantite <= 10_000
+    if "propane" in d and u == "kg":
+        return quantite <= 10_000
+    if ("dechet" in d or "dechets" in d or "gravats" in d or "dib" in d or "bois" in d) and u == "t":
+        return quantite <= 10_000
+    if "eau" in d and u == "m³":
+        return quantite <= 10_000
+    if "electricite" in d and u.lower() == "kwh":
+        return quantite <= 1_000_000
+    if "gazole" in d and u == "L":
+        return quantite <= 250_000
+    return quantite <= 10_000_000
+
+
+def _python_coherence_decision(item: dict, filename: str, scope: str, role: str) -> dict:
+    d = norm(item.get("designation", ""))
+    fn = norm(filename)
+    u = _unit_norm(item.get("unite", ""))
+    q = to_float(item.get("quantite"))
+
+    if q is None:
+        return {
+            "statut": "ANOMALIE",
+            "action": "reject",
+            "raison": "quantité illisible",
+            "confiance": "haute",
+        }
+
+    # Incohérence évidente fichier / désignation.
+    if any(k in fn for k in ["edf", "electricite", "électricité", "linky"]) and not any(k in d for k in ["electricite", "chaleur", "vapeur"]):
+        return {
+            "statut": "ANOMALIE",
+            "action": "reject",
+            "raison": "fichier énergie/EDF incompatible avec la désignation extraite",
+            "confiance": "haute",
+        }
+
+    if scope == "SCOPE_2" and not any(k in d for k in ["electricite", "chaleur", "vapeur", "reseau de chaleur", "réseau de chaleur"]):
+        return {
+            "statut": "ANOMALIE",
+            "action": "reject",
+            "raison": "SCOPE_2 incompatible avec cette donnée",
+            "confiance": "haute",
+        }
+
+    # Unités incohérentes avec la désignation.
+    if "eau" in d and u != "m³":
+        return {
+            "statut": "ANOMALIE",
+            "action": "set_a_verifier",
+            "raison": "unité eau différente de m³",
+            "confiance": "moyenne",
+        }
+
+    if "electricite" in d and u.lower() != "kwh":
+        return {
+            "statut": "ANOMALIE",
+            "action": "set_a_verifier",
+            "raison": "unité électricité différente de kWh",
+            "confiance": "moyenne",
+        }
+
+    # Conversion déterministe possible : m³ de matériaux/déchets vers tonnes.
+    # On ne l'applique que si la désignation est clairement un matériau/déchet.
+    if u == "m³" and any(k in d for k in ["gravats", "dechet", "dechets", "grave", "granulat", "sable", "terre", "calcaire"]):
+        return {
+            "statut": "AUTO_CORRECTION",
+            "action": "convert_unit",
+            "raison": "conversion m³ -> t pour matériau/déchet",
+            "ancienne_unite": u,
+            "nouvelle_unite": "t",
+            "facteur_conversion": 1.6,
+            "confiance": "haute",
+        }
+
+    if not _plausible_quantity(item.get("designation", ""), q, u):
+        return {
+            "statut": "ANOMALIE",
+            "action": "verify_with_groq",
+            "raison": "valeur hors seuil de vraisemblance",
+            "confiance": "moyenne",
+        }
+
+    return {"statut": "OK", "action": "keep", "raison": "cohérent", "confiance": "haute"}
+
+
+def _build_context_for_groq(path: str, df: pd.DataFrame | None, raw_text: str) -> str:
+    if raw_text:
+        return raw_text[:GROQ_VERIFY_CONTEXT_CHARS]
+    if df is not None and not df.empty:
+        return table_text(df, GROQ_VERIFY_CONTEXT_CHARS)
+    txt = read_text(path)
+    return txt[:GROQ_VERIFY_CONTEXT_CHARS]
+
+
+def _json_from_groq_response(text: str) -> dict | None:
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def _groq_verify_anomaly(item: dict, filename: str, scope: str, role: str, reason: str, context: str) -> dict | None:
+    global _groq_verify_calls, _req_jour
+
+    if not USE_GROQ_VERIFICATION:
+        return None
+    if _groq_verify_calls >= GROQ_VERIFY_MAX_CALLS:
+        return None
+    if not os.getenv("GROQ_API_KEY"):
+        return None
+
+    try:
+        from groq import Groq
+    except Exception:
+        return None
+
+    _groq_verify_calls += 1
+    _req_jour += 1
+
+    prompt = f"""
+Tu es un vérificateur de cohérence pour une extraction de bilan carbone.
+
+Rôle important :
+- Tu ne dois pas recalculer tout le bilan.
+- Tu dois uniquement vérifier l'anomalie signalée.
+- Tu ne dois pas inventer une donnée absente du contexte.
+- Si la valeur est incohérente et non corrigeable, demande le rejet.
+- Si une conversion d'unité est évidente, propose-la.
+- Réponds uniquement en JSON valide.
+
+Actions autorisées :
+- keep
+- reject
+- convert_unit
+- replace_quantity
+- replace_designation
+- change_scope
+- set_a_verifier
+
+Format JSON obligatoire :
+{{
+  "statut": "OK|ANOMALIE|CORRECTION",
+  "action": "keep|reject|convert_unit|replace_quantity|replace_designation|change_scope|set_a_verifier",
+  "raison": "explication courte",
+  "confiance": "haute|moyenne|faible",
+  "nouvelle_quantite": null,
+  "nouvelle_unite": null,
+  "facteur_conversion": null,
+  "nouvelle_designation": null,
+  "nouveau_scope": null
+}}
+
+Fichier : {filename}
+Scope détecté : {scope}
+Rôle détecté : {role}
+Anomalie Python : {reason}
+
+Valeur extraite :
+{json.dumps(item, ensure_ascii=False)}
+
+Contexte compact du fichier :
+{context}
+""".strip()
+
+    try:
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        resp = client.chat.completions.create(
+            model=GROQ_VERIFY_MODEL,
+            messages=[
+                {"role": "system", "content": "Réponds uniquement en JSON valide, sans markdown."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=500,
+        )
+        content = resp.choices[0].message.content or ""
+        return _json_from_groq_response(content)
+    except Exception as e:
+        print(f"  [GROQ VERIFY] indisponible : {e}")
+        return None
+
+
+def _apply_decision(item: dict, decision: dict, source_decision: str) -> dict | None:
+    action = str(decision.get("action", "keep"))
+    confidence = norm(decision.get("confiance", ""))
+    reason = str(decision.get("raison", ""))[:300]
+
+    # Si Groq est peu sûr, on ne modifie pas brutalement : on garde en vérification.
+    if source_decision == "groq" and confidence == "faible":
+        item["controle_python"] = item.get("controle_python", "ANOMALIE")
+        item["verification_groq"] = f"faible confiance : {reason}"
+        item["correction_appliquee"] = "aucune - à vérifier"
+        item["fiabilite"] = "moyenne"
+        return item
+
+    if action == "keep":
+        item.setdefault("controle_python", "OK")
+        return item
+
+    if action == "set_a_verifier":
+        item["controle_python"] = item.get("controle_python", "A_VERIFIER")
+        item["verification_groq"] = reason if source_decision == "groq" else ""
+        item["correction_appliquee"] = "marqué à vérifier"
+        item["fiabilite"] = "moyenne"
+        return item
+
+    if action == "reject":
+        print(f"  [REJET COHÉRENCE] {item.get('designation')} {item.get('quantite')} {item.get('unite')} -> {reason}")
+        return None
+
+    original_q = item.get("quantite")
+    original_u = item.get("unite")
+    original_d = item.get("designation")
+    original_scope = item.get("scope")
+
+    if action == "convert_unit":
+        factor = to_float(decision.get("facteur_conversion"))
+        new_unit = decision.get("nouvelle_unite")
+        if factor and new_unit and 0 < factor <= 1000:
+            new_q = round(float(original_q) * factor, 6)
+            if _plausible_quantity(item.get("designation", ""), new_q, str(new_unit)):
+                item["quantite_originale"] = original_q
+                item["unite_originale"] = original_u
+                item["quantite"] = new_q
+                item["unite"] = str(new_unit)
+                item["controle_python"] = item.get("controle_python", "AUTO_CORRECTION")
+                item["verification_groq"] = reason if source_decision == "groq" else ""
+                item["correction_appliquee"] = f"conversion {original_u} -> {new_unit} x{factor}"
+                item["fiabilite"] = "moyenne"
+                return item
+        return item
+
+    if action == "replace_quantity":
+        new_q = to_float(decision.get("nouvelle_quantite"))
+        if new_q is not None and _plausible_quantity(item.get("designation", ""), new_q, item.get("unite", "")):
+            item["quantite_originale"] = original_q
+            item["quantite"] = new_q
+            item["controle_python"] = item.get("controle_python", "CORRECTION")
+            item["verification_groq"] = reason if source_decision == "groq" else ""
+            item["correction_appliquee"] = f"quantité remplacée {original_q} -> {new_q}"
+            item["fiabilite"] = "moyenne"
+            return item
+        return item
+
+    if action == "replace_designation":
+        new_d = decision.get("nouvelle_designation")
+        if new_d and len(str(new_d)) <= 120:
+            item["designation_originale"] = original_d
+            item["designation"] = str(new_d)
+            item["controle_python"] = item.get("controle_python", "CORRECTION")
+            item["verification_groq"] = reason if source_decision == "groq" else ""
+            item["correction_appliquee"] = f"désignation remplacée"
+            item["fiabilite"] = "moyenne"
+            return item
+        return item
+
+    if action == "change_scope":
+        new_scope = decision.get("nouveau_scope")
+        if new_scope in {"SCOPE_1", "SCOPE_2", "SCOPE_3"}:
+            item["scope_original"] = original_scope
+            item["scope"] = new_scope
+            item["controle_python"] = item.get("controle_python", "CORRECTION")
+            item["verification_groq"] = reason if source_decision == "groq" else ""
+            item["correction_appliquee"] = f"scope remplacé {original_scope} -> {new_scope}"
+            item["fiabilite"] = "moyenne"
+            return item
+        return item
+
+    return item
+
+
+def verify_and_repair_items(items: list[dict], path: str, filename: str, scope: str, role: str, df: pd.DataFrame | None, raw_text: str) -> list[dict]:
+    if not items:
+        return []
+
+    context_cache: str | None = None
+    repaired: list[dict] = []
+
+    for item in items:
+        decision = _python_coherence_decision(item, filename, scope, role)
+        statut = decision.get("statut", "OK")
+        action = decision.get("action", "keep")
+        raison = decision.get("raison", "")
+
+        item.setdefault("controle_python", "OK" if statut == "OK" else f"{statut}: {raison}")
+
+        final_decision = decision
+
+        # Groq intervient uniquement sur les anomalies non déterministes.
+        if action == "verify_with_groq":
+            if context_cache is None:
+                context_cache = _build_context_for_groq(path, df, raw_text)
+            groq_decision = _groq_verify_anomaly(item, filename, scope, role, raison, context_cache)
+            if groq_decision:
+                final_decision = groq_decision
+                item["verification_groq"] = str(groq_decision.get("raison", ""))[:300]
+            else:
+                # Sans Groq, on rejette les anomalies extrêmes pour ne pas polluer le bilan.
+                final_decision = {
+                    "action": "reject",
+                    "raison": f"{raison} ; Groq indisponible",
+                    "confiance": "haute",
+                }
+
+        # Les auto-corrections Python ne nécessitent pas Groq.
+        source = "python" if final_decision is decision else "groq"
+        new_item = _apply_decision(item, final_decision, source)
+        if new_item is not None:
+            repaired.append(new_item)
+
+    return repaired
+
+
+
 def audit_status(item: dict) -> tuple[str, str]:
     unit = norm(item.get("unite", ""))
     q = float(item.get("quantite", 0) or 0)
@@ -830,7 +1199,7 @@ def write_audit(base_path: str, data: list[dict], no_data: list[str], nb_files: 
     for f in no_data:
         rows.append({"source": f, "scope": "", "role": "", "designation": "", "quantite": "", "unite": "", "fiabilite": "", "justification": "", "est_calcule": False, "statut": "AUCUNE_DONNEE", "alerte": "aucune donnée extraite"})
 
-    fields = ["statut", "alerte", "source", "scope", "role", "designation", "quantite", "unite", "fiabilite", "justification", "est_calcule"]
+    fields = ["statut", "alerte", "source", "scope", "role", "designation", "quantite", "unite", "fiabilite", "justification", "est_calcule", "controle_python", "verification_groq", "correction_appliquee", "quantite_originale", "unite_originale", "designation_originale", "scope_original"]
     out_csv = os.path.join(base_path, "audit_extraction_bilan_carbone.csv")
     with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=fields, delimiter=";")
@@ -846,6 +1215,8 @@ def write_audit(base_path: str, data: list[dict], no_data: list[str], nb_files: 
         "nb_ok": sum(1 for r in rows if r.get("statut") == "OK"),
         "nb_a_verifier": sum(1 for r in rows if r.get("statut") == "A_VERIFIER"),
         "nb_suspect": sum(1 for r in rows if r.get("statut") == "SUSPECT"),
+        "verification_groq_active": bool(USE_GROQ_VERIFICATION and os.getenv("GROQ_API_KEY")),
+        "nb_appels_groq_verification": _groq_verify_calls,
         "audit_csv": out_csv,
     }
     out_json = os.path.join(base_path, "audit_extraction_bilan_carbone_resume.json")
@@ -899,7 +1270,11 @@ def extract_one(path: str, scope: str) -> list[dict]:
     ):
         res = extractor()
         if res:
-            return res
+            checked = verify_and_repair_items(res, path, filename, scope, role, df, raw_text)
+            if checked:
+                return checked
+            # Si l'extraction était incohérente et rejetée, on tente l'extracteur suivant.
+            continue
 
     if role == "general":
         print("  [SKIP] rôle non reconnu, Groq désactivé par défaut")
@@ -921,7 +1296,6 @@ def iter_scope_files(base_path: str):
 def lancer_le_bilan(base_path: str = ".") -> tuple[list[dict], int]:
     print("=" * 70)
     print(VERSION)
-    print("Groq : désactivé par défaut, extraction directe Python")
     print("=" * 70)
 
     all_data: list[dict] = []
