@@ -1,131 +1,224 @@
-import pandas as pd 
-import os 
-import pymupdf 
-import re 
-from pathlib import Path 
-import glob 
+import pandas as pd
+import os
+import re
+from pathlib import Path
+import glob
 import warnings
 from PIL import Image
 from docx import Document
 
-warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+try:
+    import pymupdf
+except Exception:
+    pymupdf = None
+
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+GENERATED_DIRS = {
+    "cleaned_files",
+    "SCOPE_1",
+    "SCOPE_2",
+    "SCOPE_3",
+    "USELESS",
+    "__pycache__",
+}
+
 
 def log(msg):
     print(f"[INFO] {msg}")
 
+
+def _is_generated_or_temp(path: Path, root: Path) -> bool:
+    try:
+        rel_parts = path.relative_to(root).parts
+    except Exception:
+        rel_parts = path.parts
+
+    if any(part in GENERATED_DIRS for part in rel_parts):
+        return True
+
+    name = path.name
+    return (
+        name.startswith("~$")
+        or name.startswith(".")
+        or name.lower().endswith((".tmp", ".bak"))
+    )
+
+
+def _rel_name(path: Path, root: Path) -> str:
+    return path.relative_to(root).as_posix()
+
+
+def _read_csv_safely(path: Path) -> pd.DataFrame:
+    last_error = None
+    for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+        try:
+            return pd.read_csv(path, sep=None, engine="python", encoding=enc)
+        except Exception as e:
+            last_error = e
+
+    # Dernier essai, fréquent dans les exports français
+    for enc in ("utf-8-sig", "latin-1", "cp1252"):
+        try:
+            return pd.read_csv(path, sep=";", encoding=enc)
+        except Exception as e:
+            last_error = e
+
+    raise last_error
+
+
 def charger_tout_le_dossier(dir_path="."):
+    """
+    Charge récursivement un dossier source en conservant les sous-dossiers.
+
+    Correction importante :
+    - Avant, les fichiers étaient stockés avec Path(path).name uniquement.
+      Deux fichiers portant le même nom dans deux sous-dossiers pouvaient donc
+      s'écraser dans le dictionnaire.
+    - Maintenant, la clé est le chemin relatif :
+        ClientA/facture.csv
+        ClientB/facture.csv
+      donc aucun fichier n'est perdu.
+    """
+    root = Path(dir_path).resolve()
     data = {}
     errors = []
-    log("Scan du dossier...")
 
-    # 1. EXCEL 
-    excel_paths = glob.glob(os.path.join(dir_path, "**", "*.xlsx"), recursive=True) + \
-                  glob.glob(os.path.join(dir_path, "**", "*.xls"), recursive=True) + \
-                  glob.glob(os.path.join(dir_path, "**", "*.xlsm"), recursive=True)
-    
-    for path in excel_paths:
-        name = Path(path).name
-        # Ignorer les fichiers temporaires Excel
-        if name.startswith("~$"): continue
-        
+    log(f"Scan récursif du dossier : {root}")
+
+    all_files = sorted(
+        p for p in root.rglob("*")
+        if p.is_file() and not _is_generated_or_temp(p, root)
+    )
+
+    for path in all_files:
+        suffix = path.suffix.lower()
+        rel = _rel_name(path, root)
+        name = path.name
+
         try:
-            # Ouverture propre du fichier Excel
-            xls = pd.ExcelFile(path, engine="openpyxl")
-            processed_sheets = {}
-            
-            for sheet_name in xls.sheet_names:
-                # Lecture de la feuille
-                df = pd.read_excel(xls, sheet_name=sheet_name)
-                
-                # Vérification de sécurité : on ignore les feuilles vides
-                if df.empty or df.dropna(how='all').empty:
-                    continue
-                
-                processed_sheets[sheet_name] = df
-            
-            # Enregistrement des résultats
-            if processed_sheets:
-                data[name] = {
-                    "type": "excel", 
-                    "sheets": processed_sheets, 
-                    "nb_sheets": len(processed_sheets)
+            if suffix in {".xlsx", ".xls", ".xlsm"}:
+                xls = pd.ExcelFile(path)
+                processed_sheets = {}
+
+                for sheet_name in xls.sheet_names:
+                    df = pd.read_excel(xls, sheet_name=sheet_name)
+                    if df.empty or df.dropna(how="all").empty:
+                        continue
+                    processed_sheets[sheet_name] = df
+
+                if processed_sheets:
+                    data[rel] = {
+                        "type": "excel",
+                        "sheets": processed_sheets,
+                        "nb_sheets": len(processed_sheets),
+                        "original_path": str(path),
+                        "relative_path": rel,
+                        "name": name,
+                    }
+                    log(f"Excel '{rel}' chargé : {len(processed_sheets)} feuille(s).")
+
+            elif suffix == ".pdf":
+                if pymupdf is None:
+                    raise RuntimeError("pymupdf n'est pas disponible")
+
+                doc = pymupdf.open(path)
+                full_text = ""
+                for page in doc:
+                    full_text += page.get_text("text")
+
+                # Fallback OCR optionnel : utile pour les PDF scannés.
+                if len(full_text.strip()) < 50 and pytesseract is not None:
+                    try:
+                        ocr_parts = []
+                        for page in doc:
+                            pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
+                            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                            ocr_parts.append(pytesseract.image_to_string(img, lang="fra+eng"))
+                        full_text = "\n".join(ocr_parts)
+                        if full_text.strip():
+                            log(f"PDF '{rel}' lu par OCR")
+                    except Exception as ocr_e:
+                        log(f"OCR impossible pour '{rel}' : {ocr_e}")
+
+                doc.close()
+
+                tables_regex = re.findall(
+                    r"(\d{2}/\d{2})\s+(\d{5,6})\s+([\d,]+\.?\d*)",
+                    full_text
+                )
+
+                data[rel] = {
+                    "type": "pdf",
+                    "text": full_text,
+                    "tables_regex": tables_regex,
+                    "original_path": str(path),
+                    "relative_path": rel,
+                    "name": name,
                 }
-                log(f"Excel '{name}' chargé : {len(processed_sheets)} feuilles détectées.")
-            
+                log(f"PDF '{rel}' chargé")
+
+            elif suffix == ".csv":
+                df = _read_csv_safely(path)
+                data[rel] = {
+                    "type": "csv",
+                    "dataframe": df,
+                    "original_path": str(path),
+                    "relative_path": rel,
+                    "name": name,
+                }
+                log(f"CSV '{rel}' chargé")
+
+            elif suffix == ".txt":
+                content = ""
+                for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+                    try:
+                        content = path.read_text(encoding=enc, errors="ignore")
+                        break
+                    except Exception:
+                        continue
+
+                data[rel] = {
+                    "type": "txt",
+                    "text": content,
+                    "original_path": str(path),
+                    "relative_path": rel,
+                    "name": name,
+                }
+                log(f"TXT '{rel}' chargé")
+
+            elif suffix == ".docx":
+                doc = Document(path)
+                data[rel] = {
+                    "type": "docx",
+                    "document": doc,
+                    "original_path": str(path),
+                    "relative_path": rel,
+                    "name": name,
+                }
+                log(f"DOCX '{rel}' chargé")
+
+            elif suffix in {".jpg", ".jpeg", ".png"}:
+                img = Image.open(path)
+                data[rel] = {
+                    "type": "image",
+                    "image_object": img,
+                    "original_path": str(path),
+                    "relative_path": rel,
+                    "name": name,
+                }
+                log(f"Image '{rel}' chargée")
+
         except Exception as e:
-            errors.append((name, str(e)))
-            log(f"Erreur lors du chargement de '{name}': {e}")
+            errors.append((rel, str(e)))
+            log(f"Erreur lors du chargement de '{rel}' : {e}")
 
-    # 2. PDF
-    pdf_paths = glob.glob(os.path.join(dir_path, "**", "*.pdf"), recursive=True)
-    for path in pdf_paths:
-        name = Path(path).name
-        try:
-            doc = pymupdf.open(path)
-            full_text = ""
-            for page in doc:
-                full_text += page.get_text("text")
-            doc.close()
-            # Gestion des tabulations existantes dans un fichier pdf
-            tables_regex = re.findall(r'(\d{2}/\d{2})\s+(\d{5,6})\s+([\d,]+\.?\d*)', full_text)
-            data[name] = {"type": "pdf", "text": full_text, "tables_regex": tables_regex}
-            log(f"PDF '{name}' chargé")
-        except Exception as e:
-            errors.append((name, str(e)))
-            log(f"Erreur PDF '{name}'")
-
-    # 3. CSV
-    csv_paths = glob.glob(os.path.join(dir_path, "**", "*.csv"), recursive=True)
-    for path in csv_paths:
-        name = Path(path).name
-        try:
-            df = pd.read_csv(path)
-            data[name] = {"type": "csv", "dataframe": df}
-            log(f"CSV '{name}' chargé")
-        except Exception as e:
-            errors.append((name, str(e)))
-            log(f"Erreur CSV '{name}'")
-
-    # 4. TXT
-    text_paths = glob.glob(os.path.join(dir_path, "**", "*.txt"), recursive=True)
-    for path in text_paths:
-        name = Path(path).name
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            data[name] = {"type": "txt", "text": content} 
-            log(f"TXT '{name}' chargé")
-        except Exception as e:
-            errors.append((name, str(e)))
-            log(f"Erreur TXT '{name}'")
-
-    # 5. DOCX
-    docx_paths = glob.glob(os.path.join(dir_path, "**", "*.docx"), recursive=True)
-    for path in docx_paths:
-        name = Path(path).name
-        try:
-            doc = Document(path)
-            data[name] = {"type": "docx", "document": doc}
-            log(f"DOCX '{name}' chargé")
-        except Exception as e:
-            errors.append((name, str(e)))
-            log(f"Erreur DOCX '{name}' : {e}")
-
-    # 6. JPEG / JPG
-    jpg_paths = glob.glob(os.path.join(dir_path, "**", "*.jpg"), recursive=True) + \
-                glob.glob(os.path.join(dir_path, "**", "*.jpeg"), recursive=True)
-    for path in jpg_paths:
-        name = Path(path).name
-        try:
-            img = Image.open(path)
-            data[name] = {"type": "jpg", "image_object": img}
-            log(f"JPEG '{name}' chargé")
-        except Exception as e:
-            errors.append((name, str(e)))
-            log(f"Erreur JPEG '{name}' : {e}")
-
-    log(f"{len(data)} fichiers chargés")
-
+    log(f"{len(data)} fichier(s) chargé(s)")
     return data, errors
 
 

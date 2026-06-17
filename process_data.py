@@ -1,189 +1,224 @@
 import pandas as pd
-import pytesseract
 import os
-import load_data as ld
-import docx
 import re
 import csv
 import shutil
+from pathlib import Path
+
+import load_data as ld
 
 
-# Fichiers à exclure
-EXCLUDED_FILES = {"support_bc.xlsx", "export_bc.xlsx","Bilan_Carbone_V9.01.xlsx"}
+EXCLUDED_FILES = {
+    "support_bc.xlsx",
+    "export_bc.xlsx",
+    "Bilan_Carbone_V9.01.xlsx",
+}
+
+OUTPUT_DIR = "cleaned_files"
+
+
+def _safe_name(name: str) -> str:
+    name = str(name).strip()
+    name = re.sub(r'[<>:"/\\|?*]+', "_", name)
+    name = re.sub(r"\s+", " ", name)
+    return name[:120] if len(name) > 120 else name
+
+
+def _rel_parent(filename: str) -> Path:
+    p = Path(filename)
+    if len(p.parts) <= 1:
+        return Path("")
+    return Path(*p.parts[:-1])
+
+
+def _original_path(content: dict, filename: str) -> str:
+    return content.get("original_path") or filename
+
+
+def _out_path(filename: str, cleaned_basename: str) -> Path:
+    """
+    Conserve les sous-dossiers dans cleaned_files.
+
+    Exemple :
+    source : ClientA/Factures/facture.pdf
+    sortie : cleaned_files/ClientA/Factures/cleaned_facture.txt
+    """
+    out = Path(OUTPUT_DIR) / _rel_parent(filename) / cleaned_basename
+    out.parent.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _clean_cell_text(df: pd.DataFrame) -> pd.DataFrame:
+    df_clean = pd.DataFrame(df).copy()
+    df_clean = df_clean.dropna(how="all", axis=0)
+
+    for col in df_clean.columns:
+        if df_clean[col].dtype == "object":
+            df_clean[col] = (
+                df_clean[col]
+                .astype(str)
+                .str.replace("\n", " ", regex=False)
+                .str.replace("\r", " ", regex=False)
+                .str.replace(";", ",", regex=False)
+            )
+    return df_clean
+
+
+def _write_csv(df: pd.DataFrame, path: Path):
+    df.to_csv(
+        path,
+        index=False,
+        sep=";",
+        encoding="utf-8-sig",
+        quoting=csv.QUOTE_ALL,
+    )
 
 
 def charger_et_nettoyer(dossier_source):
     print(f"[INFO] Chargement depuis : {dossier_source}")
-    datas, errors = ld.charger_tout_le_dossier(dossier_source)
-    
-    cleaned = clean_excel(datas)
-    cleaned = clean_PDF(cleaned)
-    cleaned = clean_TXT(cleaned)   # ← nouveau : nettoyage TXT avant CSV
-    cleaned = clean_CSV(cleaned)
-    cleaned = clean_DOCX(cleaned)
-    cleaned = clean_JPEG(cleaned)
-    
-    return cleaned, errors
+
+    # Nettoyage de l'ancien dossier cleaned_files pour éviter les vieux fichiers fantômes.
+    out = Path(dossier_source) / OUTPUT_DIR
+    if out.exists():
+        shutil.rmtree(out)
+        print(f"[INFO] Ancien dossier '{OUTPUT_DIR}' supprimé.")
+    out.mkdir(parents=True, exist_ok=True)
+
+    old_cwd = os.getcwd()
+    os.chdir(dossier_source)
+    try:
+        datas, errors = ld.charger_tout_le_dossier(dossier_source)
+
+        cleaned = clean_excel(datas)
+        cleaned = clean_PDF(cleaned)
+        cleaned = clean_TXT(cleaned)
+        cleaned = clean_CSV(cleaned)
+        cleaned = clean_DOCX(cleaned)
+        cleaned = clean_IMAGES(cleaned)
+
+        return cleaned, errors
+    finally:
+        os.chdir(old_cwd)
 
 
 def clean_excel(datas):
     cleaned_datas = {}
-    output_dir = "cleaned_files"
-
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-        print(f"[INFO] Dossier '{output_dir}' créé.")
 
     for filename, content in datas.items():
-        # Ignorer les fichiers déjà traités
-        if filename.startswith("cleaned_"):
+        basename = Path(filename).name
+
+        if basename.startswith("cleaned_"):
             continue
 
-        if content["type"] != "excel":
+        if content.get("type") != "excel":
             cleaned_datas[filename] = content
             continue
 
-        if filename in EXCLUDED_FILES:
+        if basename in EXCLUDED_FILES:
             cleaned_datas[filename] = content
             print(f"[INFO] Fichier '{filename}' exclu")
             continue
 
         cleaned_sheets = {}
+        stem = Path(basename).stem
 
-        for sheet_name, df in content["sheets"].items():
+        for sheet_name, df in content.get("sheets", {}).items():
             try:
-                # 1. Copie brute, aucune modification de structure
-                df_clean = pd.DataFrame(df).copy()
+                df_clean = _clean_cell_text(df)
+                safe_sheet = _safe_name(sheet_name)
+                clean_basename = f"cleaned_{stem}_{safe_sheet}.csv"
+                save_path = _out_path(filename, clean_basename)
 
-                # 2. Suppression uniquement des lignes totalement vides
-                df_clean = df_clean.dropna(how='all', axis=0)
-                print(f"[INFO] '{filename}' - '{sheet_name}': {len(df) - len(df_clean)} lignes vides supprimées.")
+                _write_csv(df_clean, save_path)
 
-                # 3. Nettoyage des cellules
-                for col in df_clean.columns:
-                    if df_clean[col].dtype == "object":
-                        df_clean[col] = (
-                            df_clean[col]
-                            .astype(str)
-                            .str.replace("\n", " ", regex=False)
-                            .str.replace("\r", " ", regex=False)
-                            .str.replace(";", ",", regex=False)
-                        )
-
-                # 4. Sauvegarde
-                clean_filename = f"cleaned_{filename.replace('.xlsx', '').replace('.xls', '')}_{sheet_name}.csv"
-                save_path = os.path.join(output_dir, clean_filename)
-
-                # Export CSV
-                df_clean.to_csv(
-                    save_path,
-                    index=False,
-                    sep=';',
-                    encoding='utf-8-sig',
-                    quoting=csv.QUOTE_ALL
-                )
-
+                rel_out = save_path.as_posix()
                 cleaned_sheets[sheet_name] = df_clean
-                print(f"[OK] Sauvegardé sans perte : {save_path}")
+                print(f"[OK] Excel '{filename}' - '{sheet_name}' sauvegardé : {save_path}")
 
             except Exception as e:
-                print(f"[ERREUR] {filename} : {e}")
-            cleaned_datas[filename] = {
-                "type": "excel",
-                "sheets": cleaned_sheets,
-                "nb_sheets": len(cleaned_sheets)
-            }
+                print(f"[ERREUR] Excel {filename} / {sheet_name} : {e}")
+
+        cleaned_datas[filename] = {
+            "type": "excel",
+            "sheets": cleaned_sheets,
+            "nb_sheets": len(cleaned_sheets),
+            "original_path": content.get("original_path"),
+            "relative_path": content.get("relative_path", filename),
+        }
 
     return cleaned_datas
 
 
 def clean_PDF(datas):
-    output_dir = "cleaned_files"
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
     cleaned_datas = {}
 
     for filename, content in datas.items():
         if content.get("type") != "pdf":
             cleaned_datas[filename] = content
             continue
-        if filename.startswith("cleaned_"):
-            cleaned_datas[filename] = content
+
+        basename = Path(filename).name
+        if basename.startswith("cleaned_"):
             continue
 
         try:
-            # Récupération des données
             text = content.get("text", "")
             tables_regex = content.get("tables_regex", [])
 
-            # Nettoyage du texte
-            text = re.sub(r'\n+', '\n', text)
-            text = re.sub(r' +', ' ', text)
-            text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', text) 
+            text = re.sub(r"\n+", "\n", text)
+            text = re.sub(r" +", " ", text)
+            text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
             cleaned_content = text.strip()
 
-            # Sauvegarde en TXT
-            txt_path = os.path.join(output_dir, f"cleaned_{filename.replace('.pdf', '.txt')}")
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(cleaned_content)
+            txt_name = f"cleaned_{Path(basename).stem}.txt"
+            txt_path = _out_path(filename, txt_name)
+            txt_path.write_text(cleaned_content, encoding="utf-8")
 
             if tables_regex:
-                csv_path = os.path.join(output_dir, f"cleaned_{filename.replace('.pdf', '.csv')}")
-                with open(csv_path, "w", encoding="utf-8", newline='') as f:
-                    writer = csv.writer(f, delimiter=';')
-                    writer.writerow(['Date', 'ID', 'Montant'])
+                csv_name = f"cleaned_{Path(basename).stem}.csv"
+                csv_path = _out_path(filename, csv_name)
+                with csv_path.open("w", encoding="utf-8", newline="") as f:
+                    writer = csv.writer(f, delimiter=";")
+                    writer.writerow(["Date", "ID", "Montant"])
                     writer.writerows(tables_regex)
                 print(f"[OK] Données tabulaires extraites en CSV pour '{filename}'.")
 
             cleaned_datas[filename] = {
                 "type": "pdf",
-                "content": cleaned_content
+                "content": cleaned_content,
+                "original_path": content.get("original_path"),
+                "relative_path": content.get("relative_path", filename),
             }
-            print(f"[OK] PDF '{filename}' nettoyé.")
+            print(f"[OK] PDF '{filename}' nettoyé : {txt_path}")
 
         except Exception as e:
-            print(f"[ERREUR] {filename} : {e}")
+            print(f"[ERREUR] PDF {filename} : {e}")
+            cleaned_datas[filename] = content
 
     return cleaned_datas
 
 
-
 def clean_TXT(datas):
-    """Nettoie et normalise les fichiers TXT.
-    
-    Problème connu : load_data charge parfois les TXT ligne par ligne,
-    ce qui casse les tableaux exportés depuis Excel (chaque cellule
-    devient une ligne séparée). Ce nettoyage :
-    - Joint les lignes trop courtes qui semblent être des fragments
-    - Supprime les lignes vides consécutives
-    - Préserve la structure des tableaux numériques
-    """
-    output_dir = "cleaned_files"
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
     cleaned_datas = {}
 
     for filename, content in datas.items():
         f_type = str(content.get("type", "")).lower()
-
         if f_type != "txt":
             cleaned_datas[filename] = content
             continue
-        if filename.startswith("cleaned_"):
-            cleaned_datas[filename] = content
+
+        basename = Path(filename).name
+        if basename.startswith("cleaned_"):
             continue
 
         try:
             raw_text = content.get("text", "") or content.get("content", "")
 
             if not raw_text:
-                # Fallback : essayer de lire le fichier directement
-                for enc in ("utf-8", "utf-8-sig", "latin-1"):
+                src = _original_path(content, filename)
+                for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
                     try:
-                        with open(filename, "r", encoding=enc) as f:
-                            raw_text = f.read()
+                        raw_text = Path(src).read_text(encoding=enc, errors="ignore")
                         break
                     except Exception:
                         continue
@@ -194,10 +229,9 @@ def clean_TXT(datas):
                 continue
 
             lines = raw_text.splitlines()
-
             non_empty = [l for l in lines if l.strip()]
             short_lines = [l for l in non_empty if len(l.strip()) <= 15]
-            is_fragmented = len(non_empty) > 10 and len(short_lines) / len(non_empty) > 0.5
+            is_fragmented = len(non_empty) > 10 and len(short_lines) / max(len(non_empty), 1) > 0.5
 
             if is_fragmented:
                 rebuilt = []
@@ -209,8 +243,10 @@ def clean_TXT(datas):
                             rebuilt.append(" ".join(buffer))
                             buffer = []
                         continue
-                    has_number = bool(re.search(r'\d{2,}', stripped))
+
+                    has_number = bool(re.search(r"\d{2,}", stripped))
                     is_long = len(stripped) > 20
+
                     if has_number or is_long:
                         if buffer:
                             rebuilt.append(" | ".join(buffer + [stripped]))
@@ -219,36 +255,33 @@ def clean_TXT(datas):
                             rebuilt.append(stripped)
                     else:
                         buffer.append(stripped)
+
                 if buffer:
                     rebuilt.append(" ".join(buffer))
+
                 cleaned_text = "\n".join(rebuilt)
-                print(f"  [TXT] Fichier fragmenté reconstruit : {filename} "
-                      f"({len(lines)} lignes -> {len(rebuilt)} lignes)")
+                print(f"  [TXT] Fichier fragmenté reconstruit : {filename} ({len(lines)} -> {len(rebuilt)} lignes)")
             else:
-                # Nettoyage standard
                 cleaned_lines = []
                 for line in lines:
                     line = line.replace("\r", "").strip()
-                    # Supprimer les lignes de séparateurs purs
-                    if re.match(r'^[-=_*]{3,}$', line):
+                    if re.match(r"^[-=_*]{3,}$", line):
                         continue
                     cleaned_lines.append(line)
-                # Supprimer les sauts de ligne multiples
-                cleaned_text = re.sub(r'\n{3,}', '\n\n', "\n".join(cleaned_lines))
+                cleaned_text = re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned_lines))
 
-            # Nettoyage commun
-            cleaned_text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned_text)
-            cleaned_text = re.sub(r' {3,}', '  ', cleaned_text)
-            cleaned_text = cleaned_text.strip()
+            cleaned_text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", cleaned_text)
+            cleaned_text = re.sub(r" {3,}", "  ", cleaned_text).strip()
 
-            clean_filename = f"cleaned_{filename}"
-            save_path = os.path.join(output_dir, clean_filename)
-            with open(save_path, "w", encoding="utf-8") as f:
-                f.write(cleaned_text)
+            clean_basename = f"cleaned_{basename}"
+            save_path = _out_path(filename, clean_basename)
+            save_path.write_text(cleaned_text, encoding="utf-8")
 
             cleaned_datas[filename] = {
                 "type": "txt",
                 "text": cleaned_text,
+                "original_path": content.get("original_path"),
+                "relative_path": content.get("relative_path", filename),
             }
             print(f"[OK] TXT '{filename}' nettoyé : {save_path}")
 
@@ -260,18 +293,15 @@ def clean_TXT(datas):
 
 
 def clean_CSV(datas):
-    output_dir = "cleaned_files"
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
     cleaned_datas = {}
 
     for filename, content in datas.items():
         if content.get("type") != "csv":
             cleaned_datas[filename] = content
             continue
-        if filename.startswith("cleaned_"):
-            cleaned_datas[filename] = content
+
+        basename = Path(filename).name
+        if basename.startswith("cleaned_"):
             continue
 
         try:
@@ -280,84 +310,59 @@ def clean_CSV(datas):
                 print(f"[ERREUR] {filename} : DataFrame manquant.")
                 continue
 
-            # Nettoyage des données
-            for col in df.columns:
-                if df[col].dtype == "object":
-                    df[col] = (
-                        df[col]
-                        .astype(str)
-                        .str.replace("\n", " ", regex=False)
-                        .str.replace("\r", " ", regex=False)
-                        .str.replace(";", ",", regex=False)
-                    )
-
-            # Sauvegarde en CSV
-            clean_filename = f"cleaned_{filename}"
-            save_path = os.path.join(output_dir, clean_filename)
-            df.to_csv(
-                save_path,
-                index=False,
-                sep=';',
-                encoding='utf-8-sig',
-                quoting=csv.QUOTE_ALL
-            )
-            print(f"[OK] CSV '{filename}' nettoyé et sauvegardé : {save_path}")
+            df_clean = _clean_cell_text(df)
+            clean_basename = f"cleaned_{basename}"
+            save_path = _out_path(filename, clean_basename)
+            _write_csv(df_clean, save_path)
 
             cleaned_datas[filename] = {
                 "type": "csv",
-                "dataframe": df
+                "dataframe": df_clean,
+                "original_path": content.get("original_path"),
+                "relative_path": content.get("relative_path", filename),
             }
+            print(f"[OK] CSV '{filename}' nettoyé : {save_path}")
 
         except Exception as e:
-            print(f"[ERREUR] {filename} : {e}")
+            print(f"[ERREUR] CSV {filename} : {e}")
+            cleaned_datas[filename] = content
 
     return cleaned_datas
 
 
 def clean_DOCX(datas):
-    output_dir = "cleaned_files"
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
     for filename, content in datas.items():
-        f_type = str(content.get("type", "")).lower()
+        if str(content.get("type", "")).lower() != "docx":
+            continue
 
-        if f_type == "docx":
-            source_path = filename
-            new_path = os.path.join(output_dir, f"cleaned_{filename}")
+        basename = Path(filename).name
+        clean_basename = f"cleaned_{basename}"
+        save_path = _out_path(filename, clean_basename)
 
-            try:
-                shutil.copy2(source_path, new_path)
-                print(f"[OK] {filename} copié vers {output_dir}")
-            except FileNotFoundError:
-                print(f"[ERREUR] Impossible de trouver le fichier '{filename}'.")
-            except Exception as e:
-                print(f"[ERREUR] {filename} : {e}")
+        try:
+            source_path = _original_path(content, filename)
+            shutil.copy2(source_path, save_path)
+            print(f"[OK] DOCX '{filename}' copié : {save_path}")
+        except Exception as e:
+            print(f"[ERREUR] DOCX {filename} : {e}")
 
     return datas
 
 
-def clean_JPEG(datas):
-    output_dir = "cleaned_files"
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
+def clean_IMAGES(datas):
     for filename, content in datas.items():
-        f_type = str(content.get("type", "")).lower()
+        if str(content.get("type", "")).lower() not in {"image", "jpg", "jpeg", "png"}:
+            continue
 
-        if f_type in ["jpg", "jpeg"]:
-            source_path = content.get("image_object").filename if content.get("image_object") else None
-            if not source_path:
-                print(f"[ERREUR] {filename} : Chemin de l'image introuvable.")
-                continue
-            new_path = os.path.join(output_dir, f"cleaned_{filename}")
+        basename = Path(filename).name
+        clean_basename = f"cleaned_{basename}"
+        save_path = _out_path(filename, clean_basename)
 
-            try:
-                shutil.copy2(source_path, new_path)
-                print(f"[OK] {filename} copié vers {output_dir}")
-            except FileNotFoundError:
-                print(f"[ERREUR] Le fichier {filename} est introuvable à la racine.")
-            except Exception as e:
-                print(f"[ERREUR] {filename} : {e}")
+        try:
+            source_path = _original_path(content, filename)
+            shutil.copy2(source_path, save_path)
+            print(f"[OK] Image '{filename}' copiée : {save_path}")
+        except Exception as e:
+            print(f"[ERREUR] Image {filename} : {e}")
 
     return datas

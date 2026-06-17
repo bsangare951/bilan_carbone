@@ -1,17 +1,21 @@
 from __future__ import annotations
-
 import csv
 import json
 import os
 import re
 import unicodedata
+import io
+import zipfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from dotenv import load_dotenv
 
-VERSION = "BILAN CARBONE — Extraction/Calcul"
+load_dotenv()
+
+VERSION = "BILAN CARBONE — Extraction permissive générique V17 sécurisée"
 
 
 _req_jour = 0
@@ -20,6 +24,10 @@ USE_GROQ_VERIFICATION = os.getenv("USE_GROQ_VERIFICATION", "1").strip().lower() 
 GROQ_VERIFY_MODEL = os.getenv("GROQ_VERIFY_MODEL", "llama-3.1-8b-instant")
 GROQ_VERIFY_MAX_CALLS = int(os.getenv("GROQ_VERIFY_MAX_CALLS", "8"))
 GROQ_VERIFY_CONTEXT_CHARS = int(os.getenv("GROQ_VERIFY_CONTEXT_CHARS", "5000"))
+USE_GROQ_FALLBACK = os.getenv("USE_GROQ_FALLBACK", "1").strip().lower() not in {"0", "false", "non", "no", "off"}
+GROQ_FALLBACK_MAX_CALLS = int(os.getenv("GROQ_FALLBACK_MAX_CALLS", "6"))
+_groq_fallback_calls = 0
+
 
 
 SKIP_KEYWORDS = [
@@ -30,6 +38,8 @@ SKIP_KEYWORDS = [
     "rapport de vérification", "diagnostic", "fds", "fiche de données de sécurité",
     "fiche de donnees de securite", "plan des bureaux", "suivi copies", "copies",
     "impressions", "inventaire parc informatique",
+    "audit extraction bilan carbone", "audit rejets financiers",
+    "accounting review needed", "audit_extraction", "audit_rejets",
 ]
 
 ALLOW_WITH_BILAN_CARBONE = ["recap achat", "récap achat", "achat pour bilan carbone"]
@@ -144,10 +154,40 @@ def is_non_source(filename: str) -> bool:
     return any(k in f for k in SKIP_KEYWORDS)
 
 
+def source_family(source: str) -> str:
+    stem = norm(Path(str(source)).stem)
+    stem = re.sub(r"^cleaned[_ -]*", "", stem)
+    for suffix in (
+        "synthese", "synthèse", "resume", "résumé", "recap", "récap",
+        "electricite eau", "électricité eau", "energie eau", "énergie eau",
+        "donnees", "données", "data", "feuil1", "feuil2", "feuil3",
+    ):
+        stem = re.sub(rf"[_ -]+{re.escape(norm(suffix))}$", "", stem)
+    return re.sub(r"\s+", " ", stem).strip()
+
+
+def extract_site_key(text: str) -> str:
+    normalized = norm(text)
+    address_words = ("avenue", "av ", "rue", "route", "chemin", "boulevard", "za ", "zi ")
+    for postal in re.finditer(r"\b(\d{5})\b", normalized):
+        start = max(0, postal.start() - 100)
+        fragment = normalized[start:postal.end()]
+        if not any(word in fragment for word in address_words):
+            continue
+        code = postal.group(1)
+        fragment = re.sub(r"[^a-z0-9 ]+", " ", fragment)
+        fragment = re.sub(r"\s+", " ", fragment).strip()
+        return f"{code}:{fragment[-80:]}"
+    return ""
+
+
 def make_item(source: str, scope: str, role: str, designation: str, quantite: float,
               unite: str, fiabilite: str = "haute", justification: str = "extraction directe") -> dict:
     return {
         "source": source,
+        "source_family": source_family(source),
+        "site_key": "",
+        "coverage_months": 0,
         "scope": scope,
         "role": role,
         "designation": designation.strip(),
@@ -157,6 +197,214 @@ def make_item(source: str, scope: str, role: str, designation: str, quantite: fl
         "justification": justification,
         "est_calcule": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# Lecture permissive des images et DOCX contenant des tableaux
+# ---------------------------------------------------------------------------
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+
+def _ocr_pil_image(image, psm: int = 4) -> str:
+    try:
+        import pytesseract
+        command = os.getenv("TESSERACT_CMD", "").strip()
+        if command:
+            pytesseract.pytesseract.tesseract_cmd = command
+        return pytesseract.image_to_string(image, config=f"--psm {psm}")
+    except Exception as exc:
+        print(f"  [OCR indisponible] {exc}")
+        return ""
+
+
+def _visual_texts(path: str) -> list[tuple[str, object | None]]:
+    """Retourne les textes OCR et, si possible, les images associées."""
+    extension = Path(path).suffix.lower()
+    results: list[tuple[str, object | None]] = []
+
+    if extension in IMAGE_EXTENSIONS:
+        try:
+            from PIL import Image
+            image = Image.open(path).convert("RGB")
+            results.append((_ocr_pil_image(image, 4), image))
+        except Exception as exc:
+            print(f"  [IMAGE] {Path(path).name}: {exc}")
+        return results
+
+    if extension == ".docx":
+        # Texte natif éventuel.
+        try:
+            from docx import Document
+            document = Document(path)
+            native = "\n".join(p.text for p in document.paragraphs if p.text.strip())
+            for table in document.tables:
+                for row in table.rows:
+                    native += "\n" + " | ".join(cell.text for cell in row.cells)
+            if native.strip():
+                results.append((native, None))
+        except Exception:
+            pass
+
+        # Images intégrées, très fréquentes dans les fichiers clients.
+        try:
+            from PIL import Image
+            with zipfile.ZipFile(path) as archive:
+                for name in archive.namelist():
+                    if not name.startswith("word/media/"):
+                        continue
+                    try:
+                        image = Image.open(io.BytesIO(archive.read(name))).convert("RGB")
+                        results.append((_ocr_pil_image(image, 4), image))
+                    except Exception:
+                        continue
+        except Exception as exc:
+            print(f"  [DOCX OCR] {Path(path).name}: {exc}")
+    return results
+
+
+def _coverage_months(text: str) -> int:
+    months = set()
+    month_words = {
+        "jan": 1, "fev": 2, "fév": 2, "mar": 3, "avr": 4,
+        "mai": 5, "juin": 6, "juil": 7, "aou": 8, "aoû": 8,
+        "sep": 9, "oct": 10, "nov": 11, "dec": 12, "déc": 12,
+    }
+    normalized = norm(text)
+    for word, number in month_words.items():
+        for match in re.finditer(rf"\b{re.escape(norm(word))}[a-z]*[- /]*(20)?(\d{{2}})\b", normalized):
+            months.add((2000 + int(match.group(2)), number))
+    for year, month in re.findall(r"\b(20\d{2})[-/](0?[1-9]|1[0-2])\b", normalized):
+        months.add((int(year), int(month)))
+    return len(months)
+
+
+def _money_then_quantity_values(text: str) -> list[float]:
+    values: list[float] = []
+    for line in text.splitlines():
+        # Ligne type : 1 192,57 € 4 094
+        match = re.search(
+            r"\d[\d .]*(?:[,.]\d{2})\s*€?\s+(\d{3,6})(?:\s|$)",
+            line,
+        )
+        if not match:
+            continue
+        value = to_float(match.group(1))
+        if value is not None and 100 <= value <= 200_000:
+            values.append(float(value))
+    return values
+
+
+def _water_values_from_crop(text: str) -> list[float]:
+    values: list[float] = []
+    for line in text.splitlines():
+        if "€" not in line:
+            continue
+        match = re.search(r"€\s*(\d{1,5})\s*$", line.strip())
+        if not match:
+            continue
+        value = to_float(match.group(1))
+        if value is not None and 0 < value <= 100_000:
+            values.append(float(value))
+    return values
+
+
+def _extract_energy_water_from_image(image, filename: str, scope: str) -> list[dict]:
+    width, height = image.size
+    # Lecture globale + lecture séparée des deux moitiés du tableau.
+    full_text = _ocr_pil_image(image, 4)
+    left_text = _ocr_pil_image(image.crop((0, 0, int(width * 0.56), height)), 4)
+    right_text = _ocr_pil_image(image.crop((int(width * 0.45), 0, width, height)), 4)
+
+    output: list[dict] = []
+    site = extract_site_key(full_text)
+    coverage = _coverage_months(full_text)
+
+    electricity = _money_then_quantity_values(left_text)
+    if not electricity:
+        electricity = _money_then_quantity_values(full_text)
+    if electricity:
+        # Un total explicite OCR peut être capturé en plus des lignes mensuelles.
+        # S'il correspond à la somme des autres valeurs, il remplace la somme.
+        largest = max(electricity)
+        remaining_sum = sum(electricity) - largest
+        has_explicit_total = (
+            len(electricity) >= 3
+            and remaining_sum > 0
+            and abs(largest - remaining_sum) / remaining_sum <= 0.02
+        )
+        total = largest if has_explicit_total else sum(electricity)
+        detail_count = len(electricity) - 1 if has_explicit_total else len(electricity)
+        if 100 <= total <= 10_000_000:
+            item = make_item(
+                filename, "SCOPE_2", "edf", "Électricité", total, "kWh",
+                "haute", "OCR générique : total ou somme des consommations mensuelles kWh",
+            )
+            item["site_key"] = site
+            item["coverage_months"] = max(coverage, detail_count)
+            item["preuve"] = " | ".join(str(int(v)) for v in electricity[:18])
+            output.append(item)
+
+    water = _water_values_from_crop(right_text)
+    if water:
+        total = sum(water)
+        if 0 < total <= 1_000_000:
+            item = make_item(
+                filename, "SCOPE_3", "eau", "Eau potable", total, "m³",
+                "haute", "OCR générique : somme des volumes d'eau",
+            )
+            item["site_key"] = site
+            item["coverage_months"] = len(water)
+            item["preuve"] = " | ".join(str(v) for v in water[:12])
+            output.append(item)
+    return output
+
+
+def extract_visual_energy_water(path: str, filename: str, scope: str) -> list[dict]:
+    extension = Path(path).suffix.lower()
+    if extension not in IMAGE_EXTENSIONS | {".docx"}:
+        return []
+
+    best: dict[tuple[str, str], dict] = {}
+    for text, image in _visual_texts(path):
+        candidates: list[dict] = []
+        if image is not None:
+            candidates.extend(_extract_energy_water_from_image(image, filename, scope))
+        # Texte natif/OCR déjà structuré : chercher les totaux explicites.
+        normalized = norm(text)
+        if "kwh" in normalized and "electric" in normalized:
+            match = re.search(r"total[^\n]{0,80}?(\d[\d ]{3,})", text, re.I)
+            if match:
+                value = to_float(match.group(1))
+                if value and 100 <= value <= 10_000_000:
+                    item = make_item(filename, "SCOPE_2", "edf", "Électricité", value, "kWh", "haute", "total kWh OCR explicite")
+                    item["site_key"] = extract_site_key(text)
+                    item["coverage_months"] = _coverage_months(text)
+                    candidates.append(item)
+
+        for item in candidates:
+            key = (item["designation"], item["unite"])
+            current = best.get(key)
+            if current is None or (
+                int(item.get("coverage_months", 0)), float(item["quantite"])
+            ) > (
+                int(current.get("coverage_months", 0)), float(current["quantite"])
+            ):
+                best[key] = item
+
+    if best:
+        print(f"  [OCR VISUEL] {len(best)} donnée(s) extraite(s)")
+    return list(best.values())
+
+
+def enrich_energy_metadata(items: list[dict], path: str, df: pd.DataFrame | None, raw_text: str) -> None:
+    context = raw_text or table_text(df, 8000)
+    site = extract_site_key(context)
+    coverage = _coverage_months(context)
+    for item in items:
+        if norm(item.get("designation", "")) in {"electricite", "eau potable"}:
+            item["site_key"] = item.get("site_key") or site
+            item["coverage_months"] = max(int(item.get("coverage_months", 0)), coverage)
 
 # ---------------------------------------------------------------------------
 # Détection de rôle
@@ -176,6 +424,12 @@ def detect_role(filename: str, df: pd.DataFrame | None, raw_text: str) -> str:
         return "dechets"
     if any(k in blob for k in ["recap achat", "récap achat", "achat pour bilan carbone", "factures ptd", "plateforme", "fourniture de sable", "fourniture de grave"]):
         return "achats_intrants"
+    if any(k in blob for k in [
+        "compte de resultat", "compte résultat", "formulaire 2052",
+        "achats de matieres premieres", "achats de matières premières",
+        "variation de stock", "bilan fournisseur", "bilan fournisseurs",
+    ]):
+        return "achats_intrants"
     if any(k in blob for k in ["immobilisation", "immobilisations", "valeur de l'immobilisation", "valeur de l’immobilisation"]):
         return "immobilisations"
     if any(k in blob for k in ["papier", "a4", "a3", "traceur", "rouleau"]):
@@ -187,6 +441,871 @@ def detect_role(filename: str, df: pd.DataFrame | None, raw_text: str) -> str:
 # ---------------------------------------------------------------------------
 # Extracteurs directs
 # ---------------------------------------------------------------------------
+
+def extract_years(text: str) -> list[int]:
+    return [
+        int(y)
+        for y in re.findall(r"\b(20\d{2})\b", str(text))
+        if 2000 <= int(y) <= 2100
+    ]
+
+
+def resolve_target_year(paths: list[str]) -> int | None:
+    """Détermine automatiquement l'exercice le plus récent disponible.
+
+    Priorité :
+    1. années présentes dans les noms de fichiers ;
+    2. si aucune année n'est trouvée, années présentes dans le contenu.
+    """
+    years: list[int] = []
+
+    for path in paths:
+        years.extend(extract_years(Path(path).name))
+
+    if years:
+        return max(years)
+
+    for path in paths:
+        try:
+            if Path(path).suffix.lower() == ".txt":
+                years.extend(extract_years(read_text(path)[:8000]))
+            elif Path(path).suffix.lower() == ".csv":
+                years.extend(extract_years(Path(path).read_text(
+                    encoding="utf-8", errors="ignore"
+                )[:8000]))
+        except Exception:
+            continue
+
+    return max(years) if years else None
+
+
+def filename_year(filename: str) -> int | None:
+    """Détermine l'année réellement portée par le fichier.
+
+    Pour les exports Excel multiannuels, l'année de feuille placée juste avant
+    l'extension est prioritaire, par exemple :
+    "... 2023 - 2024 (...)_2023.csv" -> 2023.
+    """
+    stem = Path(filename).stem
+    trailing = re.search(r"(?:_|-|\s)(20\d{2})$", stem)
+    if trailing:
+        return int(trailing.group(1))
+
+    years = extract_years(filename)
+    return max(years) if years else None
+
+
+def should_skip_for_year(filename: str, target_year: int | None) -> bool:
+    """Écarte uniquement les sources annuelles explicitement datées.
+
+    Les factures portant un numéro contenant une année ou les dossiers
+    "2023-2024" ne doivent pas être rejetés automatiquement.
+    """
+    if target_year is None:
+        return False
+
+    f = norm(filename)
+    year = filename_year(filename)
+    if year is None or year == target_year:
+        return False
+
+    annual_markers = [
+        "reporting dechets", "reporting déchets",
+        "stats conso", "bilan annuel",
+        "suivi dechets", "suivi déchets",
+    ]
+    return any(marker in f for marker in annual_markers)
+
+
+def _dated_numeric_blocks(text: str) -> list[tuple[int, list[float]]]:
+    """Découpe un texte OCR en blocs commençant par une date complète."""
+    lines = [line.strip() for line in text.replace("\xa0", " ").splitlines() if line.strip()]
+    date_re = re.compile(r"\b\d{1,2}/\d{1,2}/(20\d{2})\b")
+    starts: list[tuple[int, int]] = []
+
+    for index, line in enumerate(lines):
+        match = date_re.search(line)
+        if match:
+            starts.append((index, int(match.group(1))))
+
+    blocks: list[tuple[int, list[float]]] = []
+    for pos, (start, year) in enumerate(starts):
+        end = starts[pos + 1][0] if pos + 1 < len(starts) else min(len(lines), start + 12)
+        values: list[float] = []
+        for line in lines[start + 1:end]:
+            if date_re.search(line):
+                break
+            value = to_float(line)
+            if value is not None:
+                values.append(value)
+        blocks.append((year, values))
+
+    return blocks
+
+
+def extract_edf_text_annual(
+    path: str,
+    filename: str,
+    scope: str,
+    target_year: int | None,
+) -> list[dict]:
+    """Lit un historique EDF vertical : date, index HP, conso HP, index HC, conso HC."""
+    if Path(path).suffix.lower() != ".txt":
+        return []
+
+    f = norm(filename)
+    if not any(word in f for word in ["edf", "electricite", "électricité"]):
+        return []
+
+    text = read_text(path)
+    blob = norm(text[:2500])
+    if not all(word in blob for word in ["heures pleines", "heures creuses"]):
+        return []
+
+    blocks = _dated_numeric_blocks(text)
+    years = sorted({year for year, values in blocks if len(values) >= 4})
+    if not years:
+        return []
+
+    selected_year = target_year if target_year in years else max(years)
+    total = 0.0
+    periods = 0
+
+    for year, values in blocks:
+        if year != selected_year or len(values) < 4:
+            continue
+
+        # Structure attendue : index HP, consommation HP, index HC, consommation HC.
+        hp_consumption = values[1]
+        hc_consumption = values[3]
+
+        if 0 <= hp_consumption <= 100_000 and 0 <= hc_consumption <= 100_000:
+            total += hp_consumption + hc_consumption
+            periods += 1
+
+    if periods == 0 or not (100 <= total <= 1_000_000):
+        return []
+
+    print(f"  [DIRECT EDF TXT] année {selected_year} -> {total:.2f} kWh")
+    return [
+        make_item(
+            filename, scope, "edf", "Électricité", total, "kWh", "haute",
+            f"somme des consommations HP et HC {selected_year}",
+        )
+    ]
+
+
+def extract_water_text_annual(
+    path: str,
+    filename: str,
+    scope: str,
+    target_year: int | None,
+) -> list[dict]:
+    """Lit seulement un véritable tableau/relevé de consommation d'eau."""
+    if Path(path).suffix.lower() != ".txt":
+        return []
+
+    f = norm(filename)
+
+    # Garde-fou principal : le nom du fichier doit explicitement annoncer un
+    # tableau, relevé ou historique de consommation d'eau.
+    allowed_name_markers = [
+        "tableau conso eau", "tableau consommation eau",
+        "releve eau", "relevé eau", "historique eau",
+        "historique releves eau", "historique relevés eau",
+        "consommation eau", "compteur eau",
+    ]
+    if not any(marker in f for marker in allowed_name_markers):
+        return []
+
+    text = read_text(path)
+    blob = norm(text[:2000])
+    if "compteur" not in blob or "conso" not in blob:
+        return []
+
+    blocks = _dated_numeric_blocks(text)
+    years = sorted({year for year, values in blocks if len(values) >= 2})
+    if not years:
+        return []
+
+    selected_year = target_year if target_year in years else max(years)
+    total = 0.0
+    periods = 0
+
+    for year, values in blocks:
+        if year != selected_year or len(values) < 2:
+            continue
+
+        # Structure attendue : index compteur puis consommation de période.
+        consumption = values[1]
+        if -10_000 <= consumption <= 10_000:
+            total += consumption
+            periods += 1
+
+    if periods == 0 or not (0 < total <= 10_000):
+        return []
+
+    print(f"  [DIRECT EAU TXT] année {selected_year} -> {total:.2f} m³")
+    return [
+        make_item(
+            filename, scope, "eau", "Eau potable", total, "m³", "haute",
+            f"somme des consommations de période {selected_year}",
+        )
+    ]
+
+
+def extract_paper_multiyear(
+    path: str,
+    filename: str,
+    scope: str,
+    target_year: int | None,
+) -> list[dict]:
+    """Lit un tableau papier comportant plusieurs années côte à côte."""
+    f = norm(filename)
+    if "recap achat papier" not in f and "récap achat papier" not in f:
+        return []
+    if Path(path).suffix.lower() != ".csv":
+        return []
+
+    raw = None
+    for encoding in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+        try:
+            raw = pd.read_csv(path, sep=";", encoding=encoding, header=None, on_bad_lines="skip")
+            if raw is not None and not raw.empty:
+                break
+        except Exception:
+            continue
+
+    if raw is None or raw.empty:
+        return []
+
+    # Repérer les cellules contenant une année, puis lire le couple
+    # TYPE / CONSOMMATION de cette zone uniquement.
+    year_positions: dict[int, int] = {}
+    for row_index in range(min(5, len(raw))):
+        for col_index in range(raw.shape[1]):
+            value = norm(raw.iat[row_index, col_index])
+            if re.fullmatch(r"20\d{2}", value):
+                year_positions[int(value)] = col_index
+
+    if not year_positions:
+        return []
+
+    selected_year = (
+        target_year if target_year in year_positions else max(year_positions)
+    )
+    start_col = year_positions[selected_year]
+    value_col = start_col + 1
+    if value_col >= raw.shape[1]:
+        return []
+
+    a4 = a3 = rolls = 0.0
+
+    for row_index in range(len(raw)):
+        label = norm(raw.iat[row_index, start_col])
+        quantity = to_float(raw.iat[row_index, value_col])
+
+        if quantity is None or quantity <= 0:
+            continue
+        if "total" in label or "reste" in label or "stock" in label:
+            continue
+
+        if re.search(r"\ba4\b", label):
+            a4 += quantity
+        elif re.search(r"\ba3\b", label):
+            a3 += quantity
+        elif "traceur" in label or "rouleau" in label:
+            rolls += quantity
+
+    kg = a4 * 0.002 + a3 * 0.004 + rolls * 0.7
+    if not (0 < kg <= 10_000):
+        return []
+
+    print(f"  [DIRECT PAPIER ANNÉE] {selected_year} -> {kg:.2f} kg")
+    return [
+        make_item(
+            filename, scope, "papier", "Papier", kg, "kg", "haute",
+            f"papier {selected_year} : A4/A3/rouleaux",
+        )
+    ]
+
+
+def _parse_accounting_columns(line: str) -> list[float]:
+    """Reconstruit les colonnes N et N-1 d'une ligne OCR comptable.
+
+    Corrige les cas OCR du type :
+      "Autres achats et charges externes (3) (6 bis) * 1789 954 765 686"
+    en [1789954, 765686].
+    """
+    clean = str(line).replace("\xa0", " ")
+
+    # Supprime les renvois de formulaire du type (3), (6 bis), [FJ], etc.
+    clean = re.sub(r"\(\s*\d+\s*(?:bis)?\s*\)", " ", clean, flags=re.I)
+    clean = re.sub(r"\[[A-Za-z]{1,3}\]|\b[A-Z]{1,3}\b", " ", clean)
+
+    # On privilégie la partie située après l'étoile/repère quand elle existe.
+    if "*" in clean:
+        clean = clean.split("*", 1)[1]
+
+    groups = re.findall(r"\d{1,4}", clean)
+    if not groups:
+        return []
+
+    # En comptabilité CERFA, deux colonnes sont souvent collées :
+    # N puis N-1. On coupe donc en deux blocs de même taille.
+    if len(groups) >= 4 and len(groups) % 2 == 0:
+        half = len(groups) // 2
+        raw_values = ["".join(groups[:half]), "".join(groups[half:])]
+    elif len(groups) >= 2:
+        raw_values = ["".join(groups)]
+    else:
+        raw_values = groups
+
+    values = []
+    for raw in raw_values:
+        try:
+            value = float(raw)
+        except Exception:
+            continue
+        if 1_000 <= value <= 50_000_000 and not 2000 <= value <= 2100:
+            values.append(value)
+    return values
+
+
+def _amounts_on_matching_line(
+    text: str,
+    keywords: list[str],
+    line_type: str = "generic",
+) -> tuple[list[float], str]:
+    """Trouve les montants d'une ligne comptable avec tolérance OCR.
+
+    line_type évite qu'une ligne "Achats" soit prise pour une ligne
+    "Variation de stock", ou inversement.
+    """
+    wanted = [norm(keyword) for keyword in keywords]
+
+    for line in text.splitlines():
+        normalized = norm(line)
+
+        direct_match = any(keyword in normalized for keyword in wanted)
+
+        if line_type == "purchases":
+            accounting_match = (
+                "achat" in normalized
+                and "variation de stock" not in normalized
+                and "mati" in normalized
+                and "prem" in normalized
+                and "approvisionnement" in normalized
+            )
+        elif line_type == "variation":
+            accounting_match = (
+                "variation de stock" in normalized
+                and "mati" in normalized
+                and "approvisionnement" in normalized
+            )
+        else:
+            accounting_match = False
+
+        if not direct_match and not accounting_match:
+            continue
+
+        values = _parse_accounting_columns(line)
+        if values:
+            return values, line.strip()
+
+    return [], ""
+
+
+
+
+def _parse_single_accounting_amount(line: str) -> float | None:
+    """Lit uniquement une ligne qui contient un montant comptable isolé.
+
+    Cette fonction refuse les numéros de contrat, immatriculations, comptes,
+    dates, pourcentages et lignes contenant du texte.
+    """
+    raw = str(line).replace("\xa0", " ").strip()
+
+    if not raw or raw in {"-", "—"}:
+        return None
+
+    # Les lignes de pourcentage et de date ne sont pas des montants.
+    if "%" in raw or re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", raw):
+        return None
+
+    # Une ligne monétaire issue du PDF détaillé est normalement uniquement
+    # numérique, avec éventuellement un signe et des séparateurs.
+    if not re.fullmatch(r"[()+\-]?\s*\d[\d .]*(?:[,.]\d{1,2})?\s*[\])}]?", raw):
+        return None
+
+    value = to_float(raw)
+    if value is None:
+        return None
+
+    value = abs(float(value))
+
+    if not (1 <= value <= 100_000_000):
+        return None
+    if 2000 <= value <= 2100:
+        return None
+
+    return value
+
+
+def _current_year_amount_after_account(
+    lines: list[str],
+    account_index: int,
+    account_pattern: re.Pattern,
+) -> float | None:
+    """Prend la première ligne monétaire après le libellé du compte.
+
+    Dans les comptes détaillés, l'ordre est :
+      exercice N, exercice N-1, variation, pourcentage.
+    """
+    for following in lines[account_index + 1:account_index + 7]:
+        if account_pattern.search(following):
+            break
+
+        value = _parse_single_accounting_amount(following)
+        if value is not None:
+            return value
+
+    return None
+
+
+def _classify_accounting_label(label: str, account: str) -> tuple[str, str, bool] | None:
+    """Classe les charges avec priorité au numéro de compte.
+
+    Cela évite par exemple de classer une sous-traitance de charpente bois
+    comme un achat de bois.
+    """
+    text = norm(label)
+    account = str(account)
+    if not account.startswith(("60", "61", "62")):
+        return None
+
+    excluded = [
+        "salaire", "remuneration", "rémunération", "charge sociale",
+        "urssaf", "retraite", "mutuelle", "impot", "impôt", "taxe",
+        "amortissement", "provision", "interet", "intérêt",
+    ]
+    if any(word in text for word in excluded):
+        return None
+
+    # 604/605 et 611 : toujours de la sous-traitance ou des prestations.
+    if account.startswith(("604", "605")):
+        if any(word in text for word in ["dechet", "déchet", "evacuation", "évacuation", "gravats", "decharge", "décharge"]):
+            return "Traitement et évacuation des déchets", "services", False
+        return "Sous-traitance de chantier", "sous_traitance", True
+    if account.startswith("611"):
+        return "Sous-traitance de chantier", "sous_traitance", True
+
+    # 624/625 : catégories propres, même si le libellé contient "service".
+    if account.startswith("624"):
+        return "Fret routier", "fret", False
+    if account.startswith("625"):
+        return "Déplacements professionnels", "deplacements", False
+
+    # 601/602/607 : achats de biens et matières.
+    if account.startswith(("601", "602", "607")):
+        material_rules = [
+            (["beton", "béton", "ciment", "mortier"], "Béton et ciment"),
+            (["bois", "contreplaque", "contreplaqué", "madrier"], "Bois"),
+            (["armature", "acier", "metallique", "métallique", "ferraille", "treillis"], "Acier et armatures métalliques"),
+            (["granulat", "grave", "sable", "terre", "caillou", "pierre", "remblai"], "Granulats / sable / terre"),
+            (["emballage", "carton", "film plastique", "palette perdue"], "Emballages"),
+        ]
+        for words, designation in material_rules:
+            if any(word in text for word in words):
+                return designation, "achats_intrants", False
+        return "Achats matériels non détaillés", "achats_intrants", False
+
+    # 606 : énergie, carburant et fournitures.
+    if account.startswith("6061"):
+        if any(word in text for word in ["gazole", "gasoil", "diesel", "essence", "carburant", "gnr", "fioul"]):
+            return "Carburant", "carburant_financier", True
+        if "eau" in text and not any(word in text for word in ["energie", "énergie", "electricite", "électricité", "gaz"]):
+            return "Eau et assainissement", "eau_financiere", True
+        return "Énergie achetée", "energie_financiere", True
+    if account.startswith(("6063", "6064")):
+        return "EPI, fournitures admin. et petit matériel", "services", False
+
+    if account.startswith(("612", "613", "614")):
+        return "Location de matériel", "services", False
+    if account.startswith("615"):
+        return "Services entretien/maintenance", "services", False
+    if account.startswith("616"):
+        return "Assurances", "services", True
+    if account.startswith("618"):
+        return "Autres services", "services", False
+    if account.startswith("621"):
+        return "Autres services", "services", False
+    if account.startswith("622"):
+        return "Autres services", "services", False
+    if account.startswith("623"):
+        return "Autres services", "services", False
+    if account.startswith("626"):
+        return "Autres services", "services", False
+    if account.startswith("627"):
+        return None
+    if account.startswith("628"):
+        return "Autres services", "services", False
+    return None
+
+
+def extract_accounting_details_generic(
+    path: str,
+    filename: str,
+    scope: str,
+) -> list[dict]:
+    """Extracteur comptable générique, indépendant du client.
+
+    Il fonctionne sur les comptes détaillés contenant des numéros de comptes
+    60/61/62 et prend uniquement la première colonne monétaire de l'exercice N.
+    """
+    if Path(path).suffix.lower() != ".txt":
+        return []
+
+    text = read_text(path)
+    normalized = norm(text[:30_000])
+
+    accounting_markers = [
+        "compte de resultat", "compte de résultat",
+        "compte de resultat detaille", "compte de résultat détaillé",
+        "soldes intermediaires de gestion", "soldes intermédiaires de gestion",
+        "details de comptes", "détails de comptes",
+        "charges d'exploitation", "charges d’exploitation",
+    ]
+    if not any(marker in normalized for marker in accounting_markers):
+        return []
+
+    lines = text.splitlines()
+    account_pattern = re.compile(r"\b(6\d{5,9})\b")
+    grouped: dict[tuple[str, str, bool], float] = {}
+    proofs: dict[tuple[str, str, bool], list[str]] = {}
+    seen_accounts: set[str] = set()
+
+    for index, line in enumerate(lines):
+        match = account_pattern.search(line)
+        if not match:
+            continue
+
+        account = match.group(1)
+        if account in seen_accounts:
+            continue
+
+        label = line[match.end():].strip(" :-\t")
+
+        # Important : les libellés peuvent contenir des numéros de contrat,
+        # d'immatriculation ou de série. Ils ne sont jamais lus comme montants.
+        current_year_amount = _current_year_amount_after_account(
+            lines, index, account_pattern
+        )
+        if current_year_amount is None:
+            continue
+
+        classification = _classify_accounting_label(label, account)
+        if classification is None:
+            continue
+
+        designation, role, blocked = classification
+
+        if not (1 <= current_year_amount <= 100_000_000):
+            continue
+
+        key = (designation, role, blocked)
+        grouped[key] = grouped.get(key, 0.0) + current_year_amount
+        proofs.setdefault(key, []).append(
+            f"{account} {label[:90]} = {current_year_amount:.2f} €"
+        )
+        seen_accounts.add(account)
+
+    if not grouped:
+        return []
+
+    # Garde-fous génériques : aucun groupe détaillé ne peut raisonnablement
+    # dépasser le total "Autres achats et charges externes" du document.
+    total_external = None
+    total_match = re.search(
+        r"Autres achats et charges externes[^\n]*\n\s*([\d .]+(?:[,.]\d{1,2})?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if total_match:
+        total_external = to_float(total_match.group(1))
+
+    cleaned_grouped: dict[tuple[str, str, bool], float] = {}
+    for key, amount in grouped.items():
+        designation, role, blocked = key
+
+        if amount <= 0:
+            continue
+
+        # Un regroupement qui dépasse 20 M€ ou dix fois le total comptable
+        # est presque certainement dû à un numéro de contrat mal lu.
+        maximum = 20_000_000.0
+        if total_external and total_external > 0:
+            maximum = min(maximum, float(total_external) * 1.10)
+
+        if amount > maximum:
+            print(
+                f"  [REJET COMPTA] {designation} = {amount:.2f} € "
+                f"(supérieur au plafond cohérent {maximum:.2f} €)"
+            )
+            continue
+
+        cleaned_grouped[key] = amount
+
+    grouped = cleaned_grouped
+    if not grouped:
+        return []
+
+    out: list[dict] = []
+    for (designation, role, blocked), amount in grouped.items():
+        item = make_item(
+            filename,
+            scope,
+            role,
+            designation,
+            amount,
+            "€",
+            "moyenne" if not blocked else "faible",
+            "somme de comptes détaillés de l'exercice courant",
+        )
+        item["preuve"] = " | ".join(proofs[(designation, role, blocked)][:8])
+        item["nb_comptes"] = len(proofs[(designation, role, blocked)])
+        if blocked:
+            item["calcul_automatique_interdit"] = True
+        out.append(item)
+
+    print(f"  [DIRECT COMPTA GÉNÉRIQUE] {len(out)} catégorie(s)")
+    for item in out:
+        suffix = " [REVUE]" if item.get("calcul_automatique_interdit") else ""
+        print(
+            f"     {item['designation'][:42]:<42} | "
+            f"{item['quantite']:>12.2f} €{suffix}"
+        )
+
+    return out
+
+
+def extract_accounting_purchases(
+    path: str,
+    filename: str,
+    scope: str,
+) -> list[dict]:
+    """Extrait les grands postes d'un compte de résultat synthétique.
+
+    Cette fonction reste générique :
+    - achats matières + variation de stock ;
+    - autres achats et charges externes ;
+    - les immobilisations sont traitées par extract_immobilisations_accounting_text().
+
+    Ces montants sont utiles lorsqu'un client fournit seulement des comptes annuels
+    et pas le détail fournisseur par fournisseur.
+    """
+    if Path(path).suffix.lower() != ".txt":
+        return []
+
+    text = read_text(path)
+    blob = norm(filename + " " + text[:20_000])
+    if not any(marker in blob for marker in [
+        "compte de resultat", "compte résultat", "bilan fournisseur",
+        "bilan fournisseurs", "formulaire 2052", "fournisseurs",
+    ]):
+        return []
+
+    output: list[dict] = []
+
+    purchases_values, purchases_line = _amounts_on_matching_line(
+        text,
+        [
+            "achats de matieres premieres et autres approvisionnements",
+            "achats de matières premières et autres approvisionnements",
+            "achats de matieres premieres",
+            "achats de matières premières",
+        ],
+        line_type="purchases",
+    )
+    variation_values, variation_line = _amounts_on_matching_line(
+        text,
+        [
+            "variation de stock matieres premieres et approvisionnements",
+            "variation de stock matières premières et approvisionnements",
+            "variation de stock (matieres",
+            "variation de stock (matières",
+        ],
+        line_type="variation",
+    )
+
+    if purchases_values:
+        purchases = purchases_values[0]
+        variation = variation_values[0] if variation_values else 0.0
+        total = purchases + variation
+
+        if 10_000 <= total <= 50_000_000:
+            print(
+                f"  [DIRECT COMPTA] achats={purchases:.2f} € | "
+                f"variation={variation:.2f} € | total={total:.2f} €"
+            )
+            item = make_item(
+                filename,
+                scope,
+                "achats_intrants",
+                "Achats matières et approvisionnements",
+                total,
+                "€",
+                "moyenne",
+                "compte de résultat : achats matières + variation de stock",
+            )
+            item["preuve"] = f"{purchases_line} | {variation_line}"[:500]
+            output.append(item)
+
+    external_values, external_line = _amounts_on_matching_line(
+        text,
+        [
+            "autres achats et charges externes",
+            "autres achats et charges externes (3)",
+            "charges externes",
+        ],
+        line_type="generic",
+    )
+
+    if external_values:
+        external = external_values[0]
+        if 10_000 <= external <= 50_000_000:
+            print(f"  [DIRECT COMPTA] charges externes={external:.2f} €")
+            item = make_item(
+                filename,
+                scope,
+                "services",
+                "Services, locations et charges externes",
+                external,
+                "€",
+                "faible",
+                "compte de résultat : autres achats et charges externes agrégés",
+            )
+            item["preuve"] = external_line[:500]
+            item["agregat_comptable"] = True
+            output.append(item)
+
+    return output
+
+
+def _groq_invoice_fallback(
+    path: str,
+    filename: str,
+    scope: str,
+    role: str,
+) -> list[dict]:
+    """Fallback limité aux factures TXT non structurées.
+
+    Il ne s'applique jamais aux tableaux physiques EDF/eau/déchets/papier.
+    """
+    global _groq_fallback_calls, _req_jour
+
+    if not USE_GROQ_FALLBACK or _groq_fallback_calls >= GROQ_FALLBACK_MAX_CALLS:
+        return []
+    if not os.getenv("GROQ_API_KEY"):
+        return []
+    if Path(path).suffix.lower() != ".txt":
+        return []
+
+    f = norm(filename)
+    if not any(marker in f for marker in ["facture", "cleaned_f ", "__cleaned_f "]):
+        return []
+    if any(marker in f for marker in [
+        "edf", "electricite", "électricité", "eau",
+        "dechet", "déchet", "papier", "carburant", "vehicule", "véhicule",
+    ]):
+        return []
+
+    text = read_text(path)[:5000]
+    if len(text.strip()) < 80:
+        return []
+
+    try:
+        from groq import Groq
+    except Exception:
+        return []
+
+    prompt = f"""
+Analyse cette facture OCR pour un bilan carbone.
+Retourne uniquement un JSON valide, sans markdown :
+
+{{
+  "designation": "EPI, fournitures admin. et petit matériel|Location de matériel|Services entretien/maintenance|Autres services|Immobilisations|null",
+  "montant_ht": 0.0,
+  "preuve": "court extrait exact",
+  "confiance": "haute|moyenne|faible"
+}}
+
+Règles :
+- utilise uniquement le montant total HT ou net HT réellement visible ;
+- ne prends jamais une TVA, un taux, une quantité, un numéro ou un prix unitaire ;
+- si le montant fiable n'est pas présent, mets designation à null ;
+- n'invente rien.
+
+Fichier : {filename}
+Texte :
+{text}
+""".strip()
+
+    try:
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        response = client.chat.completions.create(
+            model=GROQ_VERIFY_MODEL,
+            messages=[
+                {"role": "system", "content": "Réponds uniquement en JSON valide."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=350,
+        )
+        payload = _json_from_groq_response(response.choices[0].message.content or "")
+        _groq_fallback_calls += 1
+        _req_jour += 1
+    except Exception as exc:
+        print(f"  [GROQ FACTURE] indisponible : {exc}")
+        return []
+
+    if not isinstance(payload, dict):
+        return []
+
+    designation = str(payload.get("designation") or "").strip()
+    amount = to_float(payload.get("montant_ht"))
+    evidence = str(payload.get("preuve") or "").strip()
+    confidence = norm(payload.get("confiance", "faible"))
+
+    allowed = {
+        "EPI, fournitures admin. et petit matériel": "services",
+        "Location de matériel": "services",
+        "Services entretien/maintenance": "services",
+        "Autres services": "services",
+        "Immobilisations": "immobilisations",
+    }
+
+    if designation not in allowed or amount is None or amount < 10:
+        return []
+    if confidence == "faible":
+        return []
+
+    # La valeur doit être présente littéralement dans le texte OCR.
+    if not any(
+        abs(value - amount) <= max(0.02, amount * 0.0001)
+        for value in numbers_from_text(text)
+    ):
+        return []
+
+    print(f"  [GROQ FACTURE VALIDÉ] {designation} -> {amount:.2f} €")
+    item = make_item(
+        filename, scope, allowed[designation], designation, amount, "€",
+        "moyenne", "facture OCR analysée par Groq et montant vérifié",
+    )
+    item["preuve"] = evidence[:300]
+    return [item]
+
+
 
 
 def extract_propane(path: str, filename: str, scope: str) -> list[dict]:
@@ -484,6 +1603,13 @@ def classify_financial(text: str) -> tuple[str, str] | None:
     if not d or any(w in d for w in FIN_REJECT_WORDS):
         return None
 
+    if any(w in d for w in [
+        "climatisation", "climatisation reversible", "clim", "pompe a chaleur",
+        "pompe à chaleur", "groupe froid", "split mural", "fluide frigorigene",
+        "fluide frigorigène"
+    ]):
+        return "Électricité et climatisation", "services"
+
     # Catégories apparues dans l'audit V19 :
     # ce sont des achats de services généraux, pas des intrants physiques.
     if any(w in d for w in [
@@ -501,6 +1627,162 @@ def classify_financial(text: str) -> tuple[str, str] | None:
         if any(w in d for w in words):
             return cat, role
     return None
+
+
+
+MONEY_TOKEN_RE = re.compile(
+    r"(?<!\d)(\d{1,3}(?:[ \u00a0.]\d{3})+(?:[,.]\d{2})|\d+(?:[,.]\d{2}))(?!\d)"
+)
+
+
+def _money_candidates(text: str) -> list[float]:
+    values: list[float] = []
+    for token in MONEY_TOKEN_RE.findall(text or ""):
+        value = to_float(token)
+        if value is not None and 0 < value <= 20_000_000:
+            values.append(float(value))
+    return values
+
+
+def _labeled_amounts(text: str, labels: list[str]) -> list[tuple[float, str]]:
+    """Cherche un montant uniquement près d'un libellé financier explicite."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    normalized_labels = [norm(label) for label in labels]
+    found: list[tuple[float, str]] = []
+
+    for index, line in enumerate(lines):
+        normalized_line = norm(line)
+        matching = [label for label in normalized_labels if label in normalized_line]
+        if not matching:
+            continue
+
+        # Même ligne puis deux lignes suivantes, sans analyser toute la facture.
+        window = " ".join(lines[index:min(len(lines), index + 3)])
+        values = _money_candidates(window)
+        if not values:
+            continue
+
+        # Le premier montant après le libellé est généralement le bon.
+        # On conserve aussi la preuve pour l'audit.
+        found.append((values[0], window[:300]))
+
+    return found
+
+
+def extract_explicit_invoice_total(text: str) -> tuple[float | None, str, str]:
+    """Retourne un montant HT fiable, ou un TTC contrôlé à défaut.
+
+    Aucun numéro de facture, IBAN, téléphone, SIRET ou numéro de commande
+    n'est accepté comme montant.
+    """
+    if not text:
+        return None, "", ""
+
+    ht_candidates = _labeled_amounts(
+        text,
+        [
+            "total ht",
+            "net ht",
+            "montant ht",
+            "sous-total ht",
+            "sous total ht",
+            "base ht",
+        ],
+    )
+    ttc_candidates = _labeled_amounts(
+        text,
+        [
+            "total ttc",
+            "net à payer",
+            "net a payer",
+            "total à payer",
+            "total a payer",
+            "montant ttc",
+            "montant dû",
+            "montant du",
+        ],
+    )
+
+    ht = max((value for value, _ in ht_candidates), default=None)
+    ttc = max((value for value, _ in ttc_candidates), default=None)
+
+    ht_proof = next((proof for value, proof in ht_candidates if value == ht), "")
+    ttc_proof = next((proof for value, proof in ttc_candidates if value == ttc), "")
+
+    # Un OCR peut transformer 1 836,74 en 183674.
+    # Si le HT dépasse très fortement le TTC, il est rejeté.
+    if ht is not None and ttc is not None and ht > ttc * 3:
+        ht = None
+        ht_proof = ""
+
+    # Taux de TVA utilisé uniquement pour reconstruire un HT lorsqu'il manque.
+    vat_match = re.search(
+        r"(?i)(?:tva|taux)[^\n%]{0,30}?(\d{1,2}(?:[,.]\d+)?)\s*%",
+        text,
+    )
+    vat_rate = to_float(vat_match.group(1)) if vat_match else None
+
+    if ht is not None and 10 <= ht <= 20_000_000:
+        return ht, "HT", ht_proof
+
+    if ttc is not None and 10 <= ttc <= 20_000_000:
+        if vat_rate is not None and 0 < vat_rate <= 30:
+            estimated_ht = ttc / (1 + vat_rate / 100)
+            return estimated_ht, "HT reconstitué depuis TTC", ttc_proof
+        return ttc, "TTC faute de HT lisible", ttc_proof
+
+    return None, "", ""
+
+
+def extract_invoice_financial(
+    path: str,
+    filename: str,
+    scope: str,
+) -> list[dict]:
+    """Extrait au maximum un montant financier par facture."""
+    if Path(path).suffix.lower() != ".txt":
+        return []
+
+    text = read_text(path)
+    if not text:
+        return []
+
+    amount, basis, proof = extract_explicit_invoice_total(text)
+    if amount is None:
+        return []
+
+    category = classify_financial(filename + " " + text[:5000])
+    if category is None:
+        FINANCIAL_REJECTS.append(
+            {
+                "source": filename,
+                "libelle": proof[:300],
+                "montant": amount,
+                "raison": "total de facture trouvé mais catégorie non classée",
+            }
+        )
+        return []
+
+    designation, role = category
+    item = make_item(
+        filename,
+        scope,
+        role,
+        designation,
+        amount,
+        "€",
+        "moyenne",
+        f"total de facture explicite ({basis})",
+    )
+    item["preuve"] = proof[:500]
+    item["detail_financier"] = True
+    item["base_montant"] = basis
+
+    print(
+        f"  [DIRECT FACTURE] {designation} → "
+        f"{amount:.2f} € ({basis})"
+    )
+    return [item]
 
 
 def row_text(row: pd.Series) -> str:
@@ -526,7 +1808,7 @@ def amount_from_row(row: pd.Series) -> float | None:
         # ignorer années, comptes comptables, petites quantités
         if 1900 <= x <= 2100 or x in {0, 1, 2, 3, 4, 5}:
             continue
-        if 0.01 <= abs(x) <= 1_000_000:
+        if 10 <= abs(x) <= 1_000_000:
             vals.append(abs(x))
     return vals[-1] if vals else None
 
@@ -651,16 +1933,40 @@ def extract_recap_achat_synthese(df: pd.DataFrame | None, filename: str, scope: 
     return out
 
 
-def extract_financial(df: pd.DataFrame | None, filename: str, scope: str) -> list[dict]:
+def extract_financial(
+    df: pd.DataFrame | None,
+    filename: str,
+    scope: str,
+    path: str | None = None,
+) -> list[dict]:
     if df is None or df.empty:
         return []
+
     f = norm(filename)
-    if not any(k in f for k in ["recap achat", "récap achat", "achat", "facture", "immobilisation"]):
+
+    if any(k in f for k in [
+        "facture d'eau", "factures d'eau", "facture eau", "factures eau",
+        "tableau conso eau", "consommation eau",
+        "facture edf", "factures edf", "facture electricite",
+        "factures electricite", "facture électricité", "factures électricité",
+        "tableau conso edf", "consommation electricite", "consommation électricité",
+    ]):
         return []
 
-    # Cas prioritaire : récap achats avec synthèse + total HT.
-    # On utilise cette structure plutôt que les lignes détaillées pour éviter les doublons
-    # et faire ressortir les achats matériels non détaillés.
+    is_recap = any(k in f for k in [
+        "recap achat", "récap achat", "achat pour bilan carbone",
+    ])
+    is_immobilisation = "immobilisation" in f
+    is_invoice = "facture" in f
+
+    # Une facture individuelle ne doit jamais être additionnée ligne par ligne :
+    # les OCR contiennent des numéros de compte, IBAN, commandes, téléphones, etc.
+    if is_invoice and not is_recap and not is_immobilisation:
+        return extract_invoice_financial(path or "", filename, scope)
+
+    if not (is_recap or "achat" in f or is_immobilisation):
+        return []
+
     synth = extract_recap_achat_synthese(df, filename, scope)
     if synth:
         return synth
@@ -671,19 +1977,43 @@ def extract_financial(df: pd.DataFrame | None, filename: str, scope: str) -> lis
         amount = amount_from_row(row)
         if amount is None or amount <= 0:
             continue
-        cat = classify_financial(txt)
-        if cat is None:
-            if any(k in f for k in ["recap achat", "récap achat"]) and txt.strip() and txt.strip().lower() != "nan":
-                FINANCIAL_REJECTS.append({"source": filename, "libelle": txt[:300], "montant": amount, "raison": "non classé"})
+
+        category = classify_financial(txt + " " + filename)
+        if category is None:
+            if is_recap and txt.strip() and txt.strip().lower() != "nan":
+                FINANCIAL_REJECTS.append(
+                    {
+                        "source": filename,
+                        "libelle": txt[:300],
+                        "montant": amount,
+                        "raison": "non classé",
+                    }
+                )
             continue
-        designation, role = cat
+
+        designation, role = category
         grouped[(designation, role)] += amount
 
-    out = [make_item(filename, scope, role, des, q, "€", "moyenne", "extraction financière directe")
-           for (des, role), q in grouped.items()]
-    if out:
-        print(f"  [DIRECT ACHATS] {len(out)} catégorie(s) -> {sum(x['quantite'] for x in out):.2f} €")
-    return out
+    output = [
+        make_item(
+            filename,
+            scope,
+            role,
+            designation,
+            quantity,
+            "€",
+            "moyenne",
+            "extraction financière directe",
+        )
+        for (designation, role), quantity in grouped.items()
+    ]
+
+    if output:
+        print(
+            f"  [DIRECT ACHATS] {len(output)} catégorie(s) -> "
+            f"{sum(item['quantite'] for item in output):.2f} €"
+        )
+    return output
 
 
 def extract_immobilisations(df: pd.DataFrame | None, filename: str, scope: str) -> list[dict]:
@@ -724,6 +2054,15 @@ def extract_eau(df: pd.DataFrame | None, filename: str, scope: str) -> list[dict
 
     # Attestation de contrat : pas une consommation.
     if "attestation" in fn or "titulaire de contrat" in fn:
+        return []
+
+    # Un fichier déchets ou papier peut contenir des nombres/colonnes qui ne sont
+    # pas des consommations d'eau. On exige alors une source explicitement eau.
+    if any(k in fn for k in [
+        "dechet", "déchet", "reporting dechets", "reporting déchets",
+        "tableau recap dechets", "tableau récap déchets",
+        "papier", "ramette", "a4", "a3", "traceur",
+    ]):
         return []
 
     # Sécurité : un fichier EDF / électricité ne doit jamais être interprété comme eau.
@@ -828,6 +2167,83 @@ def extract_papier(df: pd.DataFrame | None, filename: str, scope: str) -> list[d
     return [make_item(filename, scope, "papier", "Papier", kg, "kg", "haute", "conversion feuilles/rouleaux en kg")]
 
 
+
+
+def extract_immobilisations_accounting_text(path: str, filename: str, scope: str) -> list[dict]:
+    """Extrait le total des acquisitions corporelles et le laisse en revue."""
+    if Path(path).suffix.lower() != ".txt":
+        return []
+    text = read_text(path)
+    start_match = None
+    for candidate in re.finditer(r"Etat des immobilisations", text, re.I):
+        if "valeur brute" in norm(text[candidate.end():candidate.end() + 800]):
+            start_match = candidate
+            break
+    if not start_match:
+        # Fallback générique OCR : certains CERFA 2050/2054 ne gardent pas
+        # le titre "Etat des immobilisations", mais la ligne d'actif contient
+        # directement "Installations techniques, matériel et outillage".
+        # On récupère le premier montant significatif de cette zone.
+        markers = [
+            "Installations techniques",
+            "materiel et outillage industriels",
+            "matériel et outillage industriels",
+        ]
+        for marker in markers:
+            pos = norm(text).find(norm(marker))
+            if pos < 0:
+                continue
+            # On revient sur le texte original en cherchant approximativement
+            # la zone autour du marqueur normalisé.
+            raw_pos = max(0, text.lower().find(marker.lower()))
+            if raw_pos < 0:
+                raw_pos = pos
+            zone = text[raw_pos:raw_pos + 500]
+            amounts = re.findall(r"\d{1,3}(?:[ .]\d{3})+", zone)
+            for raw_amount in amounts:
+                value = to_float(raw_amount)
+                if value is not None and 1_000 <= value <= 20_000_000:
+                    item = make_item(
+                        filename, "SCOPE_3", "immobilisations",
+                        "Immobilisations corporelles - acquisitions",
+                        value, "€", "moyenne",
+                        "montant d'immobilisations corporelles identifié dans le bilan actif",
+                    )
+                    item["calcul_automatique_interdit"] = False
+                    item["preuve"] = zone[:500]
+                    return [item]
+        return []
+    end_match = re.search(r"Etat des amortissements", text[start_match.end():], re.I)
+    section_end = start_match.end() + end_match.start() if end_match else min(len(text), start_match.end() + 15000)
+    section = text[start_match.start():section_end]
+    lines = [line.strip() for line in section.splitlines() if line.strip()]
+
+    acquisitions = None
+    for index, line in enumerate(lines):
+        if norm(line) != "immobilisations corporelles":
+            continue
+        nearby = []
+        for following in lines[index + 1:index + 8]:
+            value = to_float(following)
+            if value is not None and 1_000 <= value <= 20_000_000:
+                nearby.append(value)
+        if len(nearby) >= 2:
+            acquisitions = nearby[1]
+            break
+
+    if acquisitions is None:
+        return []
+    item = make_item(
+        filename, "SCOPE_3", "immobilisations",
+        "Immobilisations corporelles - acquisitions",
+        acquisitions, "€", "moyenne",
+        "total des acquisitions corporelles ; facteur monétaire immobilisations",
+    )
+    item["calcul_automatique_interdit"] = False
+    item["preuve"] = f"IMMOBILISATIONS CORPORELLES : {acquisitions:.2f} €"
+    return [item]
+
+
 # ---------------------------------------------------------------------------
 # Vérification de cohérence Python + Groq ciblé
 # ---------------------------------------------------------------------------
@@ -846,7 +2262,7 @@ def _plausible_quantity(designation: str, quantite: float, unite: str) -> bool:
 
     # Seuils volontairement larges : on bloque seulement les valeurs clairement absurdes.
     if u == "€":
-        return quantite <= 5_000_000
+        return quantite <= 100_000_000
     if "papier" in d and u == "kg":
         return quantite <= 10_000
     if "propane" in d and u == "kg":
@@ -876,8 +2292,18 @@ def _python_coherence_decision(item: dict, filename: str, scope: str, role: str)
             "confiance": "haute",
         }
 
-    # Incohérence évidente fichier / désignation.
-    if any(k in fn for k in ["edf", "electricite", "électricité", "linky"]) and not any(k in d for k in ["electricite", "chaleur", "vapeur"]):
+    effective_scope = str(item.get("scope") or scope)
+    mixed_energy_water = (
+        any(k in fn for k in ["electricite", "électricité", "energie", "énergie", "edf"])
+        and any(k in fn for k in ["eau", "water"])
+    )
+
+    # Un document mixte énergie/eau peut légitimement produire deux scopes.
+    if (
+        any(k in fn for k in ["edf", "electricite", "électricité", "linky"])
+        and not mixed_energy_water
+        and not any(k in d for k in ["electricite", "chaleur", "vapeur"])
+    ):
         return {
             "statut": "ANOMALIE",
             "action": "reject",
@@ -885,7 +2311,7 @@ def _python_coherence_decision(item: dict, filename: str, scope: str, role: str)
             "confiance": "haute",
         }
 
-    if scope == "SCOPE_2" and not any(k in d for k in ["electricite", "chaleur", "vapeur", "reseau de chaleur", "réseau de chaleur"]):
+    if effective_scope == "SCOPE_2" and not any(k in d for k in ["electricite", "chaleur", "vapeur", "reseau de chaleur", "réseau de chaleur"]):
         return {
             "statut": "ANOMALIE",
             "action": "reject",
@@ -1217,6 +2643,7 @@ def write_audit(base_path: str, data: list[dict], no_data: list[str], nb_files: 
         "nb_suspect": sum(1 for r in rows if r.get("statut") == "SUSPECT"),
         "verification_groq_active": bool(USE_GROQ_VERIFICATION and os.getenv("GROQ_API_KEY")),
         "nb_appels_groq_verification": _groq_verify_calls,
+        "nb_appels_groq_fallback": _groq_fallback_calls,
         "audit_csv": out_csv,
     }
     out_json = os.path.join(base_path, "audit_extraction_bilan_carbone_resume.json")
@@ -1232,55 +2659,195 @@ def write_audit(base_path: str, data: list[dict], no_data: list[str], nb_files: 
     print(f"  [AUDIT] CSV : {out_csv}")
 
 
+
+def remove_invoice_details_covered_by_accounts(data: list[dict]) -> list[dict]:
+    """Évite le double comptage entre comptes annuels et factures détaillées.
+
+    Si un agrégat comptable existe, les factures détaillées du même type restent
+    dans les fichiers sources mais ne sont pas ajoutées une seconde fois au bilan.
+    """
+    designations = {norm(item.get("designation", "")) for item in data}
+
+    covers_purchases = any(
+        value in designations
+        for value in {
+            "achats matieres et approvisionnements",
+            "achats matières et approvisionnements",
+            "achats materiels non detailles",
+            "achats matériels non détaillés",
+        }
+    )
+    covers_services = any(
+        value in designations
+        for value in {
+            "services, locations et charges externes",
+            "charges externes",
+        }
+    )
+    covers_immobilisations = any(
+        value in designations
+        for value in {
+            "immobilisations corporelles - acquisitions",
+            "immobilisations",
+        }
+    )
+
+    output: list[dict] = []
+    removed = 0
+
+    for item in data:
+        if not item.get("detail_financier"):
+            output.append(item)
+            continue
+
+        role = norm(item.get("role", ""))
+        covered = (
+            (covers_purchases and role == "achats_intrants")
+            or (covers_services and role == "services")
+            or (covers_immobilisations and role == "immobilisations")
+        )
+
+        if covered:
+            removed += 1
+            print(
+                f"  [DOUBLON COMPTA] {item.get('source')} ignoré : "
+                f"{item.get('designation')} déjà inclus dans un agrégat comptable"
+            )
+            continue
+
+        output.append(item)
+
+    if removed:
+        print(f"  [DOUBLON COMPTA] {removed} facture(s) détaillée(s) écartée(s)")
+    return output
+
+
 def deduplicate(data: list[dict]) -> list[dict]:
-    merged: dict[tuple, dict] = {}
-    for d in data:
-        unit = str(d.get("unite", ""))
-        # Fusionner les montants financiers par poste et scope ; garder les unités physiques par source.
-        if unit == "€":
-            key = (d["scope"], d.get("role", ""), d["designation"], unit)
-        else:
-            key = (d["source"], d["scope"], d["designation"], unit)
-        if key in merged:
-            merged[key]["quantite"] = round(float(merged[key]["quantite"]) + float(d["quantite"]), 4)
-            if d["source"] not in merged[key]["source"]:
-                merged[key]["source"] += " + " + d["source"]
-        else:
-            merged[key] = dict(d)
-    return list(merged.values())
+    """Évite les doubles comptes tout en conservant les sources distinctes."""
+    # Propager un site connu aux feuilles du même classeur/source familiale.
+    site_by_family: dict[str, str] = {}
+    for item in data:
+        if item.get("site_key"):
+            site_by_family[item.get("source_family", source_family(item.get("source", "")))] = item["site_key"]
+    for item in data:
+        family = item.get("source_family", source_family(item.get("source", "")))
+        item["source_family"] = family
+        if not item.get("site_key") and family in site_by_family:
+            item["site_key"] = site_by_family[family]
+
+    selected: dict[tuple, dict] = {}
+    for item in data:
+        designation = norm(item.get("designation", ""))
+        unit = str(item.get("unite", ""))
+        quantity = round(float(item.get("quantite", 0)), 4)
+        family = item.get("source_family", "")
+        site = item.get("site_key", "")
+
+        # Consommations : pour un même site, la source couvrant le plus de mois
+        # remplace les exports partiels/synthèses du même compteur.
+        if designation in {"electricite", "eau potable"} and site:
+            key = ("consommation", site, item.get("scope", ""), designation, unit)
+            current = selected.get(key)
+            if current is None:
+                selected[key] = dict(item)
+            else:
+                candidate_score = (quantity, int(item.get("coverage_months", 0)))
+                current_score = (round(float(current.get("quantite", 0)), 4), int(current.get("coverage_months", 0)))
+                if candidate_score > current_score:
+                    selected[key] = dict(item)
+            continue
+
+        # Même fichier/famille + même valeur = doublon exact.
+        key = (family or item.get("source", ""), item.get("scope", ""), item.get("role", ""), designation, unit, quantity)
+        if key not in selected:
+            selected[key] = dict(item)
+    return list(selected.values())
 
 
-def extract_one(path: str, scope: str) -> list[dict]:
+def extract_one(path: str, scope: str, target_year: int | None = None) -> list[dict]:
     filename = Path(path).name
     raw_text = read_text(path) if Path(path).suffix.lower() == ".txt" else ""
     df = load_table(path)
     role = detect_role(filename, df, raw_text)
+    collected: list[dict] = []
 
-    # Priorité aux extracteurs très fiables.
-    for extractor in (
+    # Les flux indépendants peuvent coexister dans un même fichier.
+    # Exception : un tableau papier multi-années ne doit pas repasser dans
+    # l'extracteur papier générique, sinon la même consommation est doublée.
+    standard_extractors = (
+        lambda: extract_visual_energy_water(path, filename, scope),
         lambda: extract_propane(path, filename, scope),
         lambda: extract_vehicules(path, filename, scope),
+        lambda: extract_edf_text_annual(path, filename, scope, target_year),
         lambda: extract_edf(path, filename, scope, df),
+        lambda: extract_water_text_annual(path, filename, scope, target_year),
         lambda: extract_immobilisations(df, filename, scope),
         lambda: extract_dechets(path, filename, scope, df),
         lambda: extract_ptd_materials(path, filename, scope),
-        lambda: extract_financial(df, filename, scope),
-        lambda: extract_papier(df, filename, scope),
         lambda: extract_eau(df, filename, scope),
-    ):
-        res = extractor()
-        if res:
-            checked = verify_and_repair_items(res, path, filename, scope, role, df, raw_text)
-            if checked:
-                return checked
-            # Si l'extraction était incohérente et rejetée, on tente l'extracteur suivant.
-            continue
+    )
+    for extractor in standard_extractors:
+        try:
+            result = extractor()
+        except Exception as exc:
+            print(f"  [EXTRACTEUR] {exc}")
+            result = []
+        if result:
+            collected.extend(result)
 
-    if role == "general":
-        print("  [SKIP] rôle non reconnu, Groq désactivé par défaut")
+    paper_year = extract_paper_multiyear(
+        path, filename, scope, target_year
+    )
+    if paper_year:
+        collected.extend(paper_year)
     else:
-        print(f"  [SKIP] aucun extracteur direct concluant ({role})")
-    return []
+        try:
+            collected.extend(extract_papier(df, filename, scope))
+        except Exception as exc:
+            print(f"  [EXTRACTEUR PAPIER] {exc}")
+
+    # Comptabilité détaillée prioritaire. Les sous-totaux ne sont utilisés
+    # qu'en l'absence de comptes détaillés, afin d'éviter le double comptage.
+    accounting_details = extract_accounting_details_generic(path, filename, scope)
+    if accounting_details:
+        collected.extend(accounting_details)
+    else:
+        summary = extract_accounting_purchases(path, filename, scope)
+        if summary:
+            collected.extend(summary)
+        financial = extract_financial(df, filename, scope, path)
+        if financial:
+            collected.extend(financial)
+
+    # Les acquisitions d'immobilisations peuvent apparaître dans un tableau
+    # distinct des comptes de résultat. On les extrait indépendamment.
+    collected.extend(extract_immobilisations_accounting_text(path, filename, scope))
+
+    checked_all: list[dict] = []
+    if collected:
+        checked = verify_and_repair_items(
+            collected, path, filename, scope, role, df, raw_text
+        )
+        if checked:
+            enrich_energy_metadata(checked, path, df, raw_text)
+            checked_all.extend(checked)
+
+    # Groq reste un dernier recours pour une facture TXT non structurée.
+    if not checked_all:
+        groq_result = _groq_invoice_fallback(path, filename, scope, role)
+        if groq_result:
+            checked = verify_and_repair_items(
+                groq_result, path, filename, scope, role, df, raw_text
+            )
+            if checked:
+                checked_all.extend(checked)
+
+    if not checked_all:
+        if role == "general":
+            print("  [SKIP] rôle non reconnu ou donnée insuffisante")
+        else:
+            print(f"  [SKIP] aucun extracteur direct concluant ({role})")
+    return deduplicate(checked_all)
 
 
 def iter_scope_files(base_path: str):
@@ -1288,8 +2855,11 @@ def iter_scope_files(base_path: str):
         folder = Path(base_path) / scope
         if not folder.exists():
             continue
-        for p in sorted(folder.iterdir()):
-            if p.is_file() and p.suffix.lower() in {".csv", ".txt", ".xlsx", ".xls", ".xlsm"}:
+        for p in sorted(folder.rglob("*")):
+            if p.is_file() and p.suffix.lower() in {
+                ".csv", ".txt", ".xlsx", ".xls", ".xlsm",
+                ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".docx",
+            }:
                 yield scope, str(p)
 
 
@@ -1302,8 +2872,13 @@ def lancer_le_bilan(base_path: str = ".") -> tuple[list[dict], int]:
     no_data: list[str] = []
     tried = 0
 
+    scope_files = list(iter_scope_files(base_path))
+    target_year = resolve_target_year([path for _, path in scope_files])
+    if target_year:
+        print(f"Exercice détecté automatiquement : {target_year}")
+
     current_scope = None
-    for scope, path in iter_scope_files(base_path):
+    for scope, path in scope_files:
         if current_scope != scope:
             current_scope = scope
             print(f"\n{'─' * 70}\nDossier : {scope}\n{'─' * 70}")
@@ -1311,10 +2886,13 @@ def lancer_le_bilan(base_path: str = ".") -> tuple[list[dict], int]:
         if is_non_source(filename):
             print(f"  [SKIP] {filename} → exclu/non source")
             continue
+        if should_skip_for_year(filename, target_year):
+            print(f"  [SKIP ANNÉE] {filename} → hors exercice {target_year}")
+            continue
         tried += 1
         print(f"\n  Traitement : {filename}")
         try:
-            res = extract_one(path, scope)
+            res = extract_one(path, scope, target_year)
         except Exception as e:
             print(f"  [ERREUR] {filename}: {e}")
             res = []
@@ -1326,6 +2904,42 @@ def lancer_le_bilan(base_path: str = ".") -> tuple[list[dict], int]:
         else:
             no_data.append(filename)
             print("  → Aucune donnée")
+
+    detailed_electricity = {
+        round(float(item.get("quantite", 0)), 4)
+        for item in all_data
+        if norm(item.get("designation", "")) == "electricite"
+        and "electricite-eau" in norm(item.get("source", ""))
+    }
+
+    if detailed_electricity:
+        filtered_data = []
+        for item in all_data:
+            is_duplicate_summary = (
+                norm(item.get("designation", "")) == "electricite"
+                and "synthese" in norm(item.get("source", ""))
+                and round(float(item.get("quantite", 0)), 4) in detailed_electricity
+            )
+            if is_duplicate_summary:
+                print(
+                    f"  [DOUBLON EDF] {item.get('source')} ignoré : "
+                    f"{item.get('quantite')} kWh déjà présent dans la feuille détaillée"
+                )
+                continue
+            filtered_data.append(item)
+        all_data = filtered_data
+
+    # Si plusieurs documents du même dossier décrivent une consommation
+    # annuelle et qu'un document couvre nettement plus de mois, il est prioritaire.
+    # Les sources sans site explicite héritent du site unique détecté dans le dossier.
+    detected_sites = {item.get("site_key") for item in all_data if item.get("site_key")}
+    if len(detected_sites) == 1:
+        only_site = next(iter(detected_sites))
+        for item in all_data:
+            if norm(item.get("designation", "")) in {"electricite", "eau potable"} and not item.get("site_key"):
+                item["site_key"] = only_site
+
+    all_data = remove_invoice_details_covered_by_accounts(all_data)
 
     dedup = deduplicate(all_data)
     removed = len(all_data) - len(dedup)

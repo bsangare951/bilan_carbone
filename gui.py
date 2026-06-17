@@ -255,6 +255,7 @@ class BilanCarboneGUI:
                     self.bilan,
                     self.data_extraite,
                     fichiers_attendus=nb_fichiers,
+                    non_calcules=non_calc,
                 )
                 duree = time.time() - t0
 

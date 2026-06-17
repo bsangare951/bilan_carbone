@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import re
 import shutil
 import unicodedata
@@ -69,6 +70,39 @@ def classify_by_rules(filename: str, text: str) -> str | None:
     tx = normalize_text(text[:2500])
     blob = f"{fn} {tx}"
 
+    # Fichiers générés par l'outil : jamais source d'activité.
+    if any(k in fn for k in ["audit_extraction", "audit_rejets", "resume", "résumé"]):
+        return "USELESS"
+
+    # Certains noms de fichiers sont suffisants même si le texte est vide
+    # (PDF scanné, OCR absent, extraction PyMuPDF vide).
+    if any(k in fn for k in ["plan d evacuation", "plan d'evacuation", "evacuation", "évacuation"]):
+        return "USELESS"
+
+    if any(k in fn for k in ["fournisseur", "fournisseurs", "achats fournisseurs", "bilan fournisseurs", "compte resultat", "compte de resultat", "grand livre", "balance generale", "journal achats"]):
+        return "SCOPE_3"
+
+    # Règle généralisante : les sous-dossiers de factures ne doivent pas tomber en USELESS
+    # uniquement parce que l'OCR est imparfait ou que le score embedding est faible.
+    if (
+        "/factures" in fn
+        or "\\factures" in fn
+        or "factures " in fn
+        or re.search(r"(^|/)cleaned_f[ _-]", fn) is not None
+    ):
+        if any(k in blob for k in ["edf", "electricite", "électricité", "linky", "kwh"]):
+            return "SCOPE_2"
+        if any(k in blob for k in ["gazole", "diesel", "gnr", "fioul", "carburant", "propane", "butane", "gaz naturel"]):
+            return "SCOPE_1"
+        return "SCOPE_3"
+
+    if "facture" in fn and any(k in fn for k in ["climatisation", "clim", "pompe a chaleur", "pompe à chaleur"]):
+        return "SCOPE_3"
+    if any(k in fn for k in ["tableau conso edf", "conso edf", "electricite", "électricité"]):
+        return "SCOPE_2"
+    if any(k in fn for k in ["tableau conso eau", "conso eau"]):
+        return "SCOPE_3"
+
     if any(normalize_text(k) in blob for k in USELESS_KEYWORDS):
         return "USELESS"
 
@@ -95,7 +129,10 @@ def classify_by_rules(filename: str, text: str) -> str | None:
         "papier", "a4", "a3", "traceur", "rouleau",
         "eau", "facture eau", "consommation eau",
         "km annuel", "kilometrage", "domicile travail",
-        "achat", "fournitures", "materiel informatique", "immobilisation"
+        "achat", "achats", "fournisseur", "fournisseurs", "facture fournisseur",
+        "fournitures", "materiel informatique", "immobilisation",
+        "climatisation", "pompe a chaleur", "pompe à chaleur", "maintenance clim",
+        "mondocunique", "bureau", "bureaux", "atelier", "depot", "dépôt", "chantier", "chantiers"
     ]):
         return "SCOPE_3"
 
@@ -146,7 +183,12 @@ def run_test(folder: str = "cleaned_files", threshold: float = 0.40) -> dict[str
         print(f"[ERREUR] Dossier introuvable : {folder}")
         return results
 
-    files = sorted(f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f)))
+    base_dir = Path(folder)
+    files = sorted(
+        str(p.relative_to(base_dir)).replace("\\", "/")
+        for p in base_dir.rglob("*")
+        if p.is_file()
+    )
     if not files:
         return results
 
@@ -202,20 +244,91 @@ def clear_scope_dirs(dest_base: str = ".") -> None:
             except Exception as e:
                 print(f"  [WARN CLEAN] Impossible de supprimer {path}: {e}")
 
-def export_per_scope(results: dict[str, str], source_folder: str = "cleaned_files", dest_base: str = ".", clean_before_export: bool = True) -> None:
+def _safe_scope_filename(relative_name: str) -> str:
+    """
+    Aplatit un chemin relatif pour éviter de copier un dossier entier dans SCOPE_X.
+
+    Exemple :
+        Factures EPI 2023-2024/cleaned_F CMO 202301062.txt
+    devient :
+        Factures EPI 2023-2024__cleaned_F CMO 202301062.txt
+
+    Ça garde l'information du sous-dossier sans recréer le sous-dossier.
+    """
+    p = Path(relative_name)
+    if len(p.parts) <= 1:
+        return p.name
+
+    parent = "__".join(p.parts[:-1])
+    candidate = f"{parent}__{p.name}"
+    candidate = re.sub(r'[<>:"/\\|?*]+', "_", candidate)
+    candidate = re.sub(r"\s+", " ", candidate).strip()
+    return candidate
+
+
+def _unique_destination(dest_dir: str, filename: str) -> str:
+    """
+    Évite d'écraser un fichier si deux sources donnent le même nom final.
+    """
+    path = Path(dest_dir) / filename
+    if not path.exists():
+        return str(path)
+
+    stem = path.stem
+    suffix = path.suffix
+    i = 2
+    while True:
+        candidate = Path(dest_dir) / f"{stem}__{i}{suffix}"
+        if not candidate.exists():
+            return str(candidate)
+        i += 1
+
+
+def export_per_scope(
+    results: dict[str, str],
+    source_folder: str = "cleaned_files",
+    dest_base: str = ".",
+    clean_before_export: bool = True,
+    preserve_subfolders: bool = False,
+) -> None:
+    """
+    Exporte les fichiers classés vers SCOPE_1 / SCOPE_2 / SCOPE_3.
+
+    Par défaut, les fichiers sont aplatis :
+        cleaned_files/Factures/fichier.txt
+        -> SCOPE_3/Factures__fichier.txt
+
+    Pourquoi ?
+    - éviter que le mapping donne l'impression de classer un dossier complet ;
+    - avoir directement tous les fichiers visibles dans le scope ;
+    - éviter les problèmes dans les traitements qui ne parcourent pas récursivement.
+
+    Si besoin, on peut conserver l'ancienne structure :
+        export_per_scope(..., preserve_subfolders=True)
+    """
     if clean_before_export:
         print("\nNettoyage des anciens dossiers SCOPE...")
         clear_scope_dirs(dest_base)
+
     for fname, scope in results.items():
         if scope not in ("SCOPE_1", "SCOPE_2", "SCOPE_3"):
             continue
+
         dest_dir = os.path.join(dest_base, scope)
         os.makedirs(dest_dir, exist_ok=True)
+
         src = os.path.join(source_folder, fname)
-        dst = os.path.join(dest_dir, fname)
+
+        if preserve_subfolders:
+            dst = os.path.join(dest_dir, fname)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+        else:
+            flat_name = _safe_scope_filename(fname)
+            dst = _unique_destination(dest_dir, flat_name)
+
         try:
             shutil.copy2(src, dst)
-            print(f"  Copié : {fname} → {scope}/")
+            print(f"  Copié : {fname} → {scope}/{Path(dst).name}")
         except Exception as e:
             print(f"  [ERREUR COPIE] {fname}: {e}")
 

@@ -8,6 +8,7 @@ import extract_files_data as ev
 import getters_data as gd
 
 KG_TO_T = 0.001
+CALCUL_VERSION = "Calcul carbone V16 - facteurs agrégés corrigés"
 
 UNITES_CALCULEES_KG = frozenset(["kgco2e", "kgco2", "co2e"])
 UNITES_CALCULEES_T = frozenset(["tco2e", "tco2"])
@@ -86,6 +87,27 @@ FACTEURS_MANUELS = [
 
 # Facteurs monétaires contrôlés (kgCO2e / euro dépensé).
 # Ils sont utilisés uniquement pour les postes Scope 3 catégorisés par extract_files_data.py.
+# Paramètres d'estimation monétaire pour les catégories précises.
+# Ces valeurs sont provisoires et doivent rester visibles dans l'audit.
+PRIX_CARBURANT_EUR_PAR_L = 1.70
+FE_GAZOLE_KGCO2E_PAR_L = 2.4108
+
+FACTEURS_MONETAIRES_PRECIS = {
+    "bois": (0.35, "kgCO2e/€", "estimation monétaire configurable - bois", 60),
+    "acier et armatures metalliques": (
+        1.70,
+        "kgCO2e/€",
+        "estimation monétaire configurable - acier/armatures",
+        60,
+    ),
+    "emballages": (
+        0.50,
+        "kgCO2e/€",
+        "estimation monétaire configurable - emballages",
+        65,
+    ),
+}
+
 FACTEURS_MONETAIRES_DIRECTS = {
     "ciment": (0.85, "kgCO2e/€", "facteur monétaire contrôlé - ciment"),
     "grave non traitee": (0.08, "kgCO2e/€", "facteur monétaire contrôlé - grave"),
@@ -98,6 +120,12 @@ FACTEURS_MONETAIRES_DIRECTS = {
     "grave recyclee": (0.05, "kgCO2e/€", "facteur monétaire contrôlé - grave recyclée"),
     "grave recyclée": (0.05, "kgCO2e/€", "facteur monétaire contrôlé - grave recyclée"),
     "granulats / sable / terre": (0.06, "kgCO2e/€", "facteur monétaire contrôlé - granulats/sable/terre"),
+    "achats matieres / approvisionnements": (0.85, "kgCO2e/€", "facteur monétaire contrôlé - achats matières/approvisionnements"),
+    "achats matières / approvisionnements": (0.85, "kgCO2e/€", "facteur monétaire contrôlé - achats matières/approvisionnements"),
+    "achats de matieres premieres": (0.85, "kgCO2e/€", "facteur monétaire contrôlé - achats matières premières"),
+    "achats de matières premières": (0.85, "kgCO2e/€", "facteur monétaire contrôlé - achats matières premières"),
+    "achats matieres et approvisionnements": (0.50, "kgCO2e/€", "facteur monétaire contrôlé - achats matières et approvisionnements agrégés"),
+    "achats matières et approvisionnements": (0.50, "kgCO2e/€", "facteur monétaire contrôlé - achats matières et approvisionnements agrégés"),
     "paves / bordures": (0.10, "kgCO2e/€", "facteur monétaire contrôlé - pavés/bordures"),
     "pavés / bordures": (0.10, "kgCO2e/€", "facteur monétaire contrôlé - pavés/bordures"),
     "epi, fournitures admin. et petit materiel": (0.367, "kgCO2e/€", "facteur monétaire contrôlé - fournitures"),
@@ -108,8 +136,13 @@ FACTEURS_MONETAIRES_DIRECTS = {
     "autres services": (0.196, "kgCO2e/€", "facteur monétaire contrôlé - services"),
     "services": (0.196, "kgCO2e/€", "facteur monétaire contrôlé - services"),
     "immobilisations": (0.273, "kgCO2e/€", "facteur monétaire contrôlé - immobilisations"),
-    "achats materiels non detailles": (1.88, "kgCO2e/€", "facteur monétaire contrôlé - achats matériels non détaillés"),
-    "achats matériels non détaillés": (1.88, "kgCO2e/€", "facteur monétaire contrôlé - achats matériels non détaillés"),
+    "achats materiels non detailles": (0.50, "kgCO2e/€", "facteur monétaire contrôlé - achats matériels non détaillés agrégés"),
+    "achats matériels non détaillés": (0.50, "kgCO2e/€", "facteur monétaire contrôlé - achats matériels non détaillés agrégés"),
+    "services, locations et charges externes": (0.052, "kgCO2e/€", "facteur monétaire contrôlé - charges externes agrégées"),
+    "charges externes": (0.052, "kgCO2e/€", "facteur monétaire contrôlé - charges externes agrégées"),
+    "electricite et climatisation": (0.273, "kgCO2e/€", "facteur monétaire contrôlé - climatisation/équipement énergétique"),
+    "électricité et climatisation": (0.273, "kgCO2e/€", "facteur monétaire contrôlé - climatisation/équipement énergétique"),
+    "immobilisations corporelles - acquisitions": (0.268, "kgCO2e/€", "facteur monétaire contrôlé - acquisitions immobilisées"),
 }
 
 FACTEURS_MANUELS_COMPLEMENTAIRES = [
@@ -172,10 +205,32 @@ def unit_is_financial(unite: str) -> bool:
 def facteur_financier_direct(designation: str, unite: str) -> tuple[float, str, str] | None:
     if not unit_is_financial(unite):
         return None
+
     d = norm(designation)
-    for key, val in FACTEURS_MONETAIRES_DIRECTS.items():
-        if key in d:
-            return val
+
+    # Catégories comptables suffisamment précises pour une estimation monétaire.
+    for key, (value, unit, source, _uncertainty) in FACTEURS_MONETAIRES_PRECIS.items():
+        if norm(key) in d:
+            return value, unit, source
+
+    # Cas générique produit par extract_files_data pour les comptes de résultat.
+    if (
+        "achat" in d
+        and any(m in d for m in ["matiere", "matière", "approvisionnement"])
+    ):
+        return (
+            0.50,
+            "kgCO2e/€",
+            "facteur monétaire contrôlé - achats matières et approvisionnements agrégés",
+        )
+
+    # On teste les clés les plus longues d'abord.
+    # Cela évite que "services" capture "Services, locations et charges externes"
+    # avant la règle plus précise.
+    for key in sorted(FACTEURS_MONETAIRES_DIRECTS, key=lambda x: len(norm(x)), reverse=True):
+        if norm(key) in d:
+            return FACTEURS_MONETAIRES_DIRECTS[key]
+
     return None
 
 
@@ -184,6 +239,40 @@ def role_achat_intrant(entry: dict) -> bool:
     src = norm(entry.get("source", ""))
     des = norm(entry.get("designation", ""))
     return role == "achats_intrants" or "recap achat" in src or any(m in des for m in ["ciment", "grave", "granulat", "sable", "terre", "pave", "pavé", "bordure"])
+
+
+def poste_comptable_trop_large(entry: dict) -> bool:
+    """Bloque les catégories comptables trop générales.
+
+    Elles restent dans l'audit, mais un facteur monétaire unique ne peut pas
+    être appliqué proprement sans ventilation plus précise.
+    """
+    d = norm(entry.get("designation", ""))
+    role = norm(entry.get("role", ""))
+
+    broad_designations = {
+        "achats materiels non detailles",
+        "achats matériels non détaillés",
+        "autres services",
+        "location de materiel",
+        "location de matériel",
+        "traitement et evacuation des dechets",
+        "traitement et évacuation des déchets",
+        "epi, fournitures admin. et petit materiel",
+        "epi, fournitures admin. et petit matériel",
+    }
+
+    if d in broad_designations:
+        return True
+
+    if role in {
+        "sous_traitance",
+        "energie_financiere",
+        "eau_financiere",
+    }:
+        return True
+
+    return False
 
 
 def designation_financiere(designation: str, unite: str) -> bool:
@@ -359,6 +448,8 @@ def variantes_designation(designation: str, unite: str) -> list[str]:
 
 
 def chercher_facteur_securise(designation: str, unite: str) -> dict | None:
+    # Pour les carburants en litres, on utilise le fallback contrôlé en priorité.
+    # Cela évite les écarts entre variantes Base Carbone (ex: 2.66 au lieu de 2.4108).
     fallback_prioritaire = facteur_fallback(designation, unite)
     if fallback_prioritaire and (norm_unit(unite) in {"l", "litre", "litres"} or "dechets verts" in norm(designation) or "déchets verts" in norm(designation)):
         print(f"    [FE fallback prioritaire] {fallback_prioritaire['designation']} : {fallback_prioritaire['valeur']} {fallback_prioritaire['unite']}")
@@ -412,16 +503,107 @@ def calculer_emissions(data_extraite: list[dict]) -> tuple[list[dict], list[dict
         desig_norm = norm(designation)
         unite_norm = norm_unit(unite)
 
+        # Carburant exprimé en euros : conversion explicite en litres estimés.
+        if (
+            unit_is_financial(unite)
+            and norm(role) == "carburant_financier"
+            and scope in {"SCOPE_1", "SCOPE_3"}
+        ):
+            montant_eur = q * 1000 if norm_unit(unite) in {"keuro", "k€"} else q
+            litres_estimes = montant_eur / PRIX_CARBURANT_EUR_PAR_L
+            em_kg = litres_estimes * FE_GAZOLE_KGCO2E_PAR_L
+            facteur_euro = FE_GAZOLE_KGCO2E_PAR_L / PRIX_CARBURANT_EUR_PAR_L
+
+            print(
+                f"  [OK CARBURANT €] {montant_eur:g} € / "
+                f"{PRIX_CARBURANT_EUR_PAR_L:.2f} €/L = {litres_estimes:.1f} L "
+                f"→ {em_kg:.2f} kgCO2e"
+            )
+            resultats.append(
+                _make_result(
+                    source,
+                    "SCOPE_1",
+                    designation,
+                    montant_eur,
+                    "€",
+                    facteur_euro,
+                    "kgCO2e/€ estimé",
+                    em_kg,
+                    "faible",
+                    65,
+                    "estimation carburant en Scope 1 : prix moyen configurable et FE gazole",
+                )
+            )
+            continue
+
+
+        # Compatibilité avec l'ancien calcul :
+        # une catégorie large est calculée lorsqu'un facteur monétaire explicite
+        # existe déjà dans FACTEURS_MONETAIRES_DIRECTS.
+        # Elle reste en revue uniquement lorsqu'aucun facteur n'est configuré.
+        if poste_comptable_trop_large(entry):
+            facteur_large = facteur_financier_direct(designation, unite)
+            if facteur_large is None:
+                print(f"  [REVUE COMPTA] {designation} ({q:g} {unite})")
+                non_calcules.append(
+                    _make_nc(
+                        source, scope, designation, q, unite,
+                        "Catégorie comptable trop large sans facteur configuré"
+                    )
+                )
+                continue
+
+        # Les postes explicitement signalés comme incertains restent en revue,
+        # sauf si un facteur monétaire contrôlé existe déjà pour cette désignation.
+        if entry.get("calcul_automatique_interdit") is True:
+            facteur_autorise = facteur_financier_direct(designation, unite)
+            if facteur_autorise is None:
+                print(f"  [REVUE REQUISE] {designation} ({q:g} {unite})")
+                non_calcules.append(
+                    _make_nc(
+                        source, scope, designation, q, unite,
+                        "Poste comptable nécessitant une ventilation ou une validation manuelle"
+                    )
+                )
+                continue
+
         # Montants Scope 3 : calcul contrôlé uniquement si le poste est catégorisé.
         if unit_is_financial(unite):
             facteur_fin = facteur_financier_direct(designation, unite)
             if scope == "SCOPE_3" and facteur_fin is not None:
                 valeur_fin, unite_fin, source_fin = facteur_fin
                 montant_eur = q * 1000 if norm_unit(unite) in {"keuro", "k€"} else q
+
+                if montant_eur > 20_000_000:
+                    print(f"  [SKIP FIN ABERRANT] {designation} : {montant_eur:.2f} €")
+                    non_calcules.append(
+                        _make_nc(
+                            source, scope, designation, montant_eur, "€",
+                            "Montant financier aberrant supérieur à 20 M€"
+                        )
+                    )
+                    continue
+
                 em_kg = montant_eur * valeur_fin
                 print(f"  [OK €] {designation[:45]} → {montant_eur:g} € × {valeur_fin:.6f} = {em_kg:.2f} kgCO2e")
-                incert_fin = 80 if "achats materiels non detailles" in norm(designation) or "achats matériels non détaillés" in norm(designation) else 50
-                resultats.append(_make_result(source, scope, designation, montant_eur, "€", valeur_fin, unite_fin, em_kg, fiabilite, incert_fin, source_fin))
+                incert_fin = 50
+                d_fin = norm(designation)
+
+                if "achats materiels non detailles" in d_fin or "achats matériels non détaillés" in d_fin:
+                    incert_fin = 80
+
+                for key, (_value, _unit, _source, configured_uncertainty) in FACTEURS_MONETAIRES_PRECIS.items():
+                    if norm(key) in d_fin:
+                        incert_fin = configured_uncertainty
+                        break
+
+                resultats.append(
+                    _make_result(
+                        source, scope, designation, montant_eur, "€",
+                        valeur_fin, unite_fin, em_kg, fiabilite,
+                        incert_fin, source_fin
+                    )
+                )
                 continue
             print(f"  [SKIP FIN] {designation} ({unite})")
             continue
@@ -633,7 +815,7 @@ def calculer_incertitude_bilan(bilan: dict, data_extraite: list[dict], fichiers_
     # Ajoute une pénalité si beaucoup de données extraites n'ont pas pu être calculées.
     if data_extraite:
         taux_non_calc = len(non_calcules or []) / max(len(data_extraite), 1)
-        incert_non_calc = min(taux_non_calc * 50, 30)
+        incert_non_calc = min(taux_non_calc * 100, 100)
     else:
         incert_non_calc = 0.0
 
@@ -642,6 +824,7 @@ def calculer_incertitude_bilan(bilan: dict, data_extraite: list[dict], fichiers_
         "incertitude_facteurs_%": round(incert_fe, 2),
         "incertitude_fichiers_%": round(incert_fichiers, 2),
         "incertitude_non_calcule_%": round(incert_non_calc, 2),
+        "incertitude_donnees_non_calculees_%": round(incert_non_calc, 2),
         "incertitude_globale_%": globale,
         "niveau_confiance": "haute" if globale < 20 else "moyenne" if globale < 40 else "faible",
     }
