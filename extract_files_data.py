@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = "BILAN CARBONE — Extraction permissive générique V17 sécurisée"
+VERSION = "BILAN CARBONE — Extraction permissive générique V18 multi-clients"
 
 
 _req_jour = 0
@@ -161,6 +161,7 @@ def source_family(source: str) -> str:
         "synthese", "synthèse", "resume", "résumé", "recap", "récap",
         "electricite eau", "électricité eau", "energie eau", "énergie eau",
         "donnees", "données", "data", "feuil1", "feuil2", "feuil3",
+        "cumul par compte", "hors cessions", "etat des immobilisations", "état des immobilisations",
     ):
         stem = re.sub(rf"[_ -]+{re.escape(norm(suffix))}$", "", stem)
     return re.sub(r"\s+", " ", stem).strip()
@@ -513,6 +514,8 @@ def should_skip_for_year(filename: str, target_year: int | None) -> bool:
         "reporting dechets", "reporting déchets",
         "stats conso", "bilan annuel",
         "suivi dechets", "suivi déchets",
+        "recap achat papier", "récap achat papier",
+        "tableau recap achat papier", "tableau récap achat papier",
     ]
     return any(marker in f for marker in annual_markers)
 
@@ -1410,6 +1413,7 @@ def extract_vehicules(path: str, filename: str, scope: str) -> list[dict]:
 def extract_edf(path: str, filename: str, scope: str, df: pd.DataFrame | None) -> list[dict]:
     if df is None or df.empty:
         return []
+
     blob = norm(filename + " " + table_text(df, 3000))
     if not any(k in blob for k in ["edf", "kwh", "electricite", "électricité"]):
         return []
@@ -1423,21 +1427,42 @@ def extract_edf(path: str, filename: str, scope: str, df: pd.DataFrame | None) -
                 useful_cols.append(col)
 
     if useful_cols:
-        for col in useful_cols:
-            vals = [to_float(v) for v in df[col].tolist()]
-            vals = [v for v in vals if v is not None and 0 < v < 500000]
-            if not vals:
-                continue
-            total_rows = df[df.apply(lambda r: any("total" in norm(x) for x in r.values), axis=1)]
-            if not total_rows.empty:
-                for v in total_rows[col].tolist():
-                    x = to_float(v)
-                    if x and 100 <= x <= 500000:
-                        candidates.append(x)
-            if not candidates and len(vals) >= 3:
-                s = sum(vals)
-                if 100 <= s <= 500000:
-                    candidates.append(s)
+        total_rows = df[df.apply(lambda r: any("total" in norm(x) for x in r.values), axis=1)]
+
+        if not total_rows.empty:
+            for _, total_row in total_rows.iterrows():
+                row_values: list[float] = []
+                for col in useful_cols:
+                    x = to_float(total_row.get(col))
+                    if x is not None and 100 <= x <= 500000:
+                        row_values.append(float(x))
+
+                if row_values:
+                    # Cas fréquent EDF : une colonne HC + une colonne HP.
+                    # Le total annuel est la somme, pas le maximum.
+                    total = sum(row_values)
+                    if 100 <= total <= 1_000_000:
+                        candidates.append(total)
+
+                    # On garde aussi les valeurs unitaires en secours, mais
+                    # la somme sera choisie car elle est plus grande.
+                    candidates.extend(row_values)
+
+        if not candidates:
+            column_sums: list[float] = []
+            for col in useful_cols:
+                vals = [to_float(v) for v in df[col].tolist()]
+                vals = [v for v in vals if v is not None and 0 < v < 500000]
+                if len(vals) >= 3:
+                    s = sum(vals)
+                    if 100 <= s <= 500000:
+                        column_sums.append(float(s))
+
+            if column_sums:
+                total = sum(column_sums)
+                if 100 <= total <= 1_000_000:
+                    candidates.append(total)
+                candidates.extend(column_sums)
 
     # Fallback : si une ligne Total existe, prendre le plus gros nombre plausible non financier.
     if not candidates:
@@ -1448,16 +1473,21 @@ def extract_edf(path: str, filename: str, scope: str, df: pd.DataFrame | None) -
                 if vals:
                     candidates.append(max(vals))
 
-
     fn = norm(filename)
     if not candidates and "stats conso edf 2024" in fn:
         candidates.append(65880.0)
 
     if not candidates:
         return []
+
     q = max(candidates)
     print(f"  [DIRECT EDF] {q:.2f} kWh")
-    return [make_item(filename, scope, "edf", "Électricité", q, "kWh", "haute", "extraction directe kWh")]
+    return [
+        make_item(
+            filename, scope, "edf", "Électricité", q, "kWh", "haute",
+            "extraction directe kWh ; somme HP/HC si disponible",
+        )
+    ]
 
 
 def classify_waste(label: str) -> tuple[str, float | None] | None:
@@ -1473,6 +1503,113 @@ def classify_waste(label: str) -> tuple[str, float | None] | None:
     if any(k in d for k in ["dechets verts", "déchets verts", "souche", "souches", "vegetaux", "végétaux"]):
         return "Déchets verts - Compostage domestique en tas - Impacts", None
     return None
+
+
+
+def extract_dechets_recap_multiyear(
+    path: str,
+    filename: str,
+    scope: str,
+    df: pd.DataFrame | None,
+    target_year: int | None,
+) -> list[dict]:
+    """Lit un tableau récapitulatif déchets avec colonnes par année.
+
+    Exemple générique :
+    Fournisseur | Type de déchets | Unité | 2025 | Poids total | 2024 | Poids total
+    """
+    if df is None or df.empty:
+        return []
+
+    f = norm(filename)
+    if not any(k in f for k in [
+        "tableau recap dechets", "tableau récap déchets",
+        "recap dechets", "récap déchets",
+        "repartition des dechets", "répartition des déchets",
+    ]):
+        return []
+
+    raw = df.copy()
+    # Recherche des colonnes contenant une année dans les premières lignes.
+    year_columns: dict[int, int] = {}
+    for row_index in range(min(8, len(raw))):
+        for col_index in range(raw.shape[1]):
+            cell = norm(raw.iat[row_index, col_index])
+            match = re.search(r"\b(20\d{2})\b", cell)
+            if match:
+                year_columns[int(match.group(1))] = col_index
+
+    if not year_columns:
+        return []
+
+    selected_year = target_year if target_year in year_columns else max(year_columns)
+    start_col = year_columns[selected_year]
+
+    # La colonne "poids total" se trouve souvent juste après la colonne de passage.
+    candidate_weight_cols = [
+        col for col in range(start_col, min(start_col + 3, raw.shape[1]))
+        if any("poids" in norm(raw.iat[r, col]) or "total" in norm(raw.iat[r, col])
+               for r in range(min(6, len(raw))))
+    ]
+    weight_col = candidate_weight_cols[-1] if candidate_weight_cols else min(start_col + 1, raw.shape[1] - 1)
+
+    grouped: dict[tuple[str, str], float] = defaultdict(float)
+
+    for row_index in range(len(raw)):
+        row = [raw.iat[row_index, c] for c in range(raw.shape[1])]
+        label = " ".join(str(x) for x in row[:3] if str(x).strip() and str(x).lower() != "nan")
+        label_n = norm(label)
+
+        if not label_n or any(k in label_n for k in ["fournisseur", "poids total", "type de dechets", "type de déchets"]):
+            continue
+
+        q = to_float(row[weight_col])
+        if q is None or q <= 0:
+            continue
+
+        unit_n = norm(row[2] if len(row) > 2 else "")
+        if q > 10_000 and any(k in unit_n for k in ["u/l", "ul", "l"]):
+            # Bacs en litres : 52 passages de 1000 L -> 52 000 L.
+            # Densité prudente déchets de bureau : 0,30 t/m3.
+            q = (q / 1000.0) * 0.30
+            unit = "t"
+            designation = "Déchets non dangereux en mélange (DIB) - Fin de vie hors"
+        else:
+            unit = "m³" if any(k in unit_n for k in ["m3", "m³"]) else "t"
+            classified = classify_waste(label)
+            if not classified:
+                continue
+            designation, density = classified
+
+            if "bloc beton" in label_n or "bloc béton" in label_n:
+                density = 2.4
+            elif "terre" in label_n and unit == "m³":
+                density = 1.6
+
+            if unit == "m³" and density:
+                q = q * density
+                unit = "t"
+
+        grouped[(designation, unit)] += q
+
+    out: list[dict] = []
+    for (designation, unit), quantity in grouped.items():
+        item = make_item(
+            filename,
+            scope,
+            "dechets",
+            designation,
+            quantity,
+            unit,
+            "haute",
+            f"tableau récapitulatif déchets {selected_year}",
+        )
+        item["agregat_dechets"] = True
+        out.append(item)
+
+    if out:
+        print(f"  [DIRECT DECHETS RÉCAP] année {selected_year} -> {len(out)} catégorie(s)")
+    return out
 
 
 def extract_dechets(path: str, filename: str, scope: str, df: pd.DataFrame | None) -> list[dict]:
@@ -1535,44 +1672,73 @@ def extract_ptd_materials(path: str, filename: str, scope: str) -> list[dict]:
         return []
 
     fn = norm(filename)
-    # Très important : les reportings déchets doivent passer par extract_dechets,
-    # jamais par l'extracteur "factures matériaux", sinon les quantités explosent.
+    # Les reportings déchets structurés passent par extract_dechets /
+    # extract_dechets_recap_multiyear.
     if any(k in fn for k in ["reporting dechets", "reporting déchets", "tableau recap dechets", "tableau récap déchets"]):
         return []
 
-    n = norm(filename + " " + txt[:2000])
-    if not any(k in n for k in ["ptd", "plateforme", "fourniture", "sable", "grave", "calcaire", "gravats"]):
+    n = norm(filename + " " + txt[:3000])
+    if not any(k in n for k in ["ptd", "plateforme", "fourniture", "sable", "grave", "calcaire", "gravats", "bloc beton", "bloc béton"]):
         return []
 
+    lines = [line.strip() for line in txt.replace("\xa0", " ").splitlines() if line.strip()]
     grouped: dict[tuple[str, str], float] = defaultdict(float)
-    for line in txt.splitlines():
+
+    for index, line in enumerate(lines):
         nl = norm(line)
-        if not any(k in nl for k in ["sable", "grave", "calcaire", "granulat", "gravats", "bloc beton", "bloc béton"]):
+        if not any(k in nl for k in [
+            "fourniture de sable", "fourniture de grave", "fourniture de gravillon",
+            "fourniture de calcaire", "fourniture de granulat",
+            "mise en decharge de gravats", "mise en décharge de gravats",
+            "mise en decharge de bloc beton", "mise en décharge de bloc béton",
+        ]):
             continue
-        vals = numbers_from_text(line)
-        if not vals:
+
+        window = " ".join(lines[index:min(index + 5, len(lines))])
+        match = re.search(r"(\d+(?:[,.]\d+)?)\s*(m3|m³|t)\b", window, re.I)
+        if not match:
             continue
-        q = next((v for v in vals if 0 < v <= 5000), None)
-        if q is None:
+
+        q = to_float(match.group(1))
+        if q is None or q <= 0:
             continue
-        unit = "m³" if any(k in nl for k in ["m3", "m³"]) else "t"
+
+        unit = "m³" if norm(match.group(2)) in {"m3", "m³"} else "t"
+
+        previous = " ".join(lines[max(0, index - 20):index]).upper()
+        # Avoir partiel : quantité à retrancher.
+        sign = -1 if "AVOIR" in previous and "FACTURE" not in previous.split("AVOIR")[-1] else 1
+        q *= sign
+
         mat = material_category(line)
         if mat:
-            des, _role = mat
+            designation, _role = mat
             if unit == "m³":
                 q *= 1.6
                 unit = "t"
-            grouped[(des, unit)] += q
+            grouped[(designation, unit)] += q
         elif any(k in nl for k in ["gravats", "bloc beton", "bloc béton"]):
+            # Les déchets issus des factures sont conservés uniquement s'il
+            # n'existe pas de reporting/récapitulatif déchets plus complet.
+            density = 2.4 if "bloc beton" in nl or "bloc béton" in nl else 1.6
             if unit == "m³":
-                q *= 1.6
+                q *= density
                 unit = "t"
             grouped[("Déchets inertes en mélange (Gravats) - Fin de vie hors", unit)] += q
 
     out = []
-    for (des, unit), q in grouped.items():
-        role = "dechets" if des.startswith("Déchets") else "achats_intrants"
-        out.append(make_item(filename, scope, role, des, q, unit, "haute", "extraction directe facture matériaux"))
+    for (designation, unit), quantity in grouped.items():
+        if abs(quantity) <= 0:
+            continue
+        role = "dechets" if designation.startswith("Déchets") else "achats_intrants"
+        item = make_item(
+            filename, scope, role, designation, quantity, unit, "haute",
+            "extraction directe facture matériaux"
+        )
+        if role == "dechets":
+            item["detail_dechets_facture"] = True
+        out.append(item)
+
     if out:
         print(f"  [DIRECT MATERIAUX] {len(out)} ligne(s)")
     return out
@@ -2722,6 +2888,40 @@ def remove_invoice_details_covered_by_accounts(data: list[dict]) -> list[dict]:
     return output
 
 
+
+def remove_waste_details_covered_by_recap(data: list[dict]) -> list[dict]:
+    has_waste_recap = any(item.get("agregat_dechets") for item in data)
+    if not has_waste_recap:
+        return data
+
+    output: list[dict] = []
+    removed = 0
+    for item in data:
+        if item.get("agregat_dechets"):
+            output.append(item)
+            continue
+
+        role = norm(item.get("role", ""))
+        source = norm(item.get("source", ""))
+        if role == "dechets" and (
+            "reporting dechets" in source
+            or "reporting déchets" in source
+            or item.get("detail_dechets_facture")
+        ):
+            removed += 1
+            print(
+                f"  [DOUBLON DÉCHETS] {item.get('source')} ignoré : "
+                f"récapitulatif annuel déchets déjà présent"
+            )
+            continue
+
+        output.append(item)
+
+    if removed:
+        print(f"  [DOUBLON DÉCHETS] {removed} ligne(s) de détail écartée(s)")
+    return output
+
+
 def deduplicate(data: list[dict]) -> list[dict]:
     """Évite les doubles comptes tout en conservant les sources distinctes."""
     # Propager un site connu aux feuilles du même classeur/source familiale.
@@ -2782,6 +2982,7 @@ def extract_one(path: str, scope: str, target_year: int | None = None) -> list[d
         lambda: extract_edf(path, filename, scope, df),
         lambda: extract_water_text_annual(path, filename, scope, target_year),
         lambda: extract_immobilisations(df, filename, scope),
+        lambda: extract_dechets_recap_multiyear(path, filename, scope, df, target_year),
         lambda: extract_dechets(path, filename, scope, df),
         lambda: extract_ptd_materials(path, filename, scope),
         lambda: extract_eau(df, filename, scope),
@@ -2939,6 +3140,7 @@ def lancer_le_bilan(base_path: str = ".") -> tuple[list[dict], int]:
             if norm(item.get("designation", "")) in {"electricite", "eau potable"} and not item.get("site_key"):
                 item["site_key"] = only_site
 
+    all_data = remove_waste_details_covered_by_recap(all_data)
     all_data = remove_invoice_details_covered_by_accounts(all_data)
 
     dedup = deduplicate(all_data)

@@ -8,7 +8,7 @@ import extract_files_data as ev
 import getters_data as gd
 
 KG_TO_T = 0.001
-CALCUL_VERSION = "Calcul carbone V16 - facteurs agrégés corrigés"
+CALCUL_VERSION = "Calcul carbone V18 - facteurs différenciés multi-clients"
 
 UNITES_CALCULEES_KG = frozenset(["kgco2e", "kgco2", "co2e"])
 UNITES_CALCULEES_T = frozenset(["tco2e", "tco2"])
@@ -130,14 +130,14 @@ FACTEURS_MONETAIRES_DIRECTS = {
     "pavés / bordures": (0.10, "kgCO2e/€", "facteur monétaire contrôlé - pavés/bordures"),
     "epi, fournitures admin. et petit materiel": (0.367, "kgCO2e/€", "facteur monétaire contrôlé - fournitures"),
     "epi, fournitures admin. et petit matériel": (0.367, "kgCO2e/€", "facteur monétaire contrôlé - fournitures"),
-    "location de materiel": (0.196, "kgCO2e/€", "facteur monétaire contrôlé - services"),
-    "location de matériel": (0.196, "kgCO2e/€", "facteur monétaire contrôlé - services"),
-    "services entretien/maintenance": (0.196, "kgCO2e/€", "facteur monétaire contrôlé - maintenance"),
+    "location de materiel": (0.296, "kgCO2e/€", "facteur monétaire contrôlé - location/outillage chantier"),
+    "location de matériel": (0.296, "kgCO2e/€", "facteur monétaire contrôlé - location/outillage chantier"),
+    "services entretien/maintenance": (0.215, "kgCO2e/€", "facteur monétaire contrôlé - maintenance multitechnique"),
     "autres services": (0.196, "kgCO2e/€", "facteur monétaire contrôlé - services"),
     "services": (0.196, "kgCO2e/€", "facteur monétaire contrôlé - services"),
     "immobilisations": (0.273, "kgCO2e/€", "facteur monétaire contrôlé - immobilisations"),
-    "achats materiels non detailles": (0.50, "kgCO2e/€", "facteur monétaire contrôlé - achats matériels non détaillés agrégés"),
-    "achats matériels non détaillés": (0.50, "kgCO2e/€", "facteur monétaire contrôlé - achats matériels non détaillés agrégés"),
+    "achats materiels non detailles": (1.88, "kgCO2e/€", "facteur monétaire contrôlé - achats matériels/chantier non détaillés"),
+    "achats matériels non détaillés": (1.88, "kgCO2e/€", "facteur monétaire contrôlé - achats matériels/chantier non détaillés"),
     "services, locations et charges externes": (0.052, "kgCO2e/€", "facteur monétaire contrôlé - charges externes agrégées"),
     "charges externes": (0.052, "kgCO2e/€", "facteur monétaire contrôlé - charges externes agrégées"),
     "electricite et climatisation": (0.273, "kgCO2e/€", "facteur monétaire contrôlé - climatisation/équipement énergétique"),
