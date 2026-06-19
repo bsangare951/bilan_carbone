@@ -8,7 +8,7 @@ import extract_files_data as ev
 import getters_data as gd
 
 KG_TO_T = 0.001
-CALCUL_VERSION = "Calcul carbone V18 - facteurs différenciés multi-clients"
+CALCUL_VERSION = "Calcul carbone V19 - physique prioritaire et monétaire variable"
 
 UNITES_CALCULEES_KG = frozenset(["kgco2e", "kgco2", "co2e"])
 UNITES_CALCULEES_T = frozenset(["tco2e", "tco2"])
@@ -176,6 +176,116 @@ FACTEURS_MANUELS_COMPLEMENTAIRES = [
 ]
 
 
+# Nouvelle logique générale : les montants financiers sont traités comme des
+# estimations variables, jamais comme des données aussi fiables que les unités
+# physiques. Le facteur central sert au total principal, les facteurs min/max
+# servent à afficher une fourchette.
+FACTEURS_MONETAIRES_VARIABLES = {
+    "carburant_financier": {
+        "autorise": True,
+        "facteur_min": 1.20,
+        "facteur_defaut": 1.42,
+        "facteur_max": 1.80,
+        "incertitude": 65,
+        "source": "estimation monétaire variable - carburant via prix moyen configurable",
+    },
+    "achats_intrants_precis": {
+        "autorise": True,
+        "facteur_min": 0.30,
+        "facteur_defaut": 0.85,
+        "facteur_max": 1.80,
+        "incertitude": 75,
+        "source": "estimation monétaire variable - matériaux / intrants identifiés",
+    },
+    "fournitures": {
+        "autorise": True,
+        "facteur_min": 0.15,
+        "facteur_defaut": 0.35,
+        "facteur_max": 0.80,
+        "incertitude": 80,
+        "source": "estimation monétaire variable - fournitures / petit matériel",
+    },
+    "location_materiel": {
+        "autorise": True,
+        "facteur_min": 0.08,
+        "facteur_defaut": 0.30,
+        "facteur_max": 0.70,
+        "incertitude": 85,
+        "source": "estimation monétaire variable - location de matériel",
+    },
+    "maintenance": {
+        "autorise": True,
+        "facteur_min": 0.05,
+        "facteur_defaut": 0.22,
+        "facteur_max": 0.60,
+        "incertitude": 85,
+        "source": "estimation monétaire variable - entretien / maintenance",
+    },
+    "dechets_financier": {
+        "autorise": True,
+        "facteur_min": 0.05,
+        "facteur_defaut": 0.25,
+        "facteur_max": 0.80,
+        "incertitude": 90,
+        "source": "estimation monétaire variable - déchets exprimés en euros",
+    },
+    "fret_financier": {
+        "autorise": True,
+        "facteur_min": 0.03,
+        "facteur_defaut": 0.12,
+        "facteur_max": 0.40,
+        "incertitude": 90,
+        "source": "estimation monétaire variable - fret exprimé en euros",
+    },
+    "deplacements_financiers": {
+        "autorise": True,
+        "facteur_min": 0.05,
+        "facteur_defaut": 0.20,
+        "facteur_max": 0.60,
+        "incertitude": 90,
+        "source": "estimation monétaire variable - déplacements exprimés en euros",
+    },
+    "immobilisations": {
+        "autorise": True,
+        "facteur_min": 0.10,
+        "facteur_defaut": 0.35,
+        "facteur_max": 1.20,
+        "incertitude": 90,
+        "source": "estimation monétaire variable - immobilisations",
+    },
+    "achats_non_detailles_recap": {
+        "autorise": True,
+        "facteur_min": 0.70,
+        "facteur_defaut": 1.88,
+        "facteur_max": 3.00,
+        "incertitude": 95,
+        "source": "estimation monétaire variable - achats matériels non détaillés issus d'un récap achat bilan carbone",
+    },
+    "autres_services_recap": {
+        "autorise": True,
+        "facteur_min": 0.05,
+        "facteur_defaut": 0.196,
+        "facteur_max": 0.50,
+        "incertitude": 90,
+        "source": "estimation monétaire variable - autres services issus d'un récap achat bilan carbone",
+    },
+}
+
+BROAD_FINANCIAL_DESIGNATIONS = frozenset({
+    "achats materiels non detailles",
+    "achats matériels non détaillés",
+    "sous-traitance de chantier",
+    "sous traitance de chantier",
+    "assurances",
+    "autres services",
+    "services, locations et charges externes",
+    "charges externes",
+    "eau et assainissement",
+    "energie achetee",
+    "énergie achetée",
+})
+
+
 
 def norm(txt: Any) -> str:
     return gd.normalize_text(str(txt or ""))
@@ -239,6 +349,17 @@ def role_achat_intrant(entry: dict) -> bool:
     src = norm(entry.get("source", ""))
     des = norm(entry.get("designation", ""))
     return role == "achats_intrants" or "recap achat" in src or any(m in des for m in ["ciment", "grave", "granulat", "sable", "terre", "pave", "pavé", "bordure"])
+
+
+def is_recap_achat_bilan_source(entry: dict) -> bool:
+    """True si le montant vient d'un récap achat explicitement préparé pour le bilan carbone."""
+    src = norm(entry.get("source", ""))
+    justification = norm(entry.get("justification", ""))
+    return any(k in src for k in [
+        "recap achat", "récap achat", "achat pour bilan carbone",
+    ]) or any(k in justification for k in [
+        "synthese recap achats", "synthèse récap achats", "recap achats", "récap achats",
+    ])
 
 
 def poste_comptable_trop_large(entry: dict) -> bool:
@@ -480,6 +601,140 @@ def source_avec_litres_carburant(data_extraite: list[dict]) -> set[str]:
     return sources
 
 
+def montant_en_euros(quantite: float, unite: str) -> float:
+    u = norm_unit(unite)
+    if u in {"keuro", "keur", "k€"}:
+        return float(quantite) * 1000.0
+    return float(quantite)
+
+
+def _safe_float(value: Any, default: float | None = None) -> float | None:
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def categorie_monetaire_variable(entry: dict) -> str | None:
+    """Classe un montant financier dans une catégorie suffisamment exploitable.
+
+    Ajustement : les postes vagues restent bloqués par défaut, sauf s'ils
+    viennent d'un récap achat explicitement préparé pour le bilan carbone.
+    """
+    role = norm(entry.get("role", ""))
+    designation = norm(entry.get("designation", ""))
+
+    if is_recap_achat_bilan_source(entry):
+        if designation in {"achats materiels non detailles", "achats matériels non détaillés"} or role == "achats_non_detailles":
+            return "achats_non_detailles_recap"
+        if designation == "autres services" or role == "services":
+            return "autres_services_recap"
+
+    if entry.get("calcul_automatique_interdit") is True:
+        return None
+
+    unite = str(entry.get("unite", ""))
+    if norm_unit(unite) == "revue_manuelle":
+        return None
+
+    if entry.get("monetaire_autorise") is False:
+        return None
+
+    categorie = norm(entry.get("categorie_monetaire", ""))
+    if categorie and categorie not in {"revue_manuelle", "trop_large"}:
+        return categorie
+
+    if designation in BROAD_FINANCIAL_DESIGNATIONS:
+        return None
+
+    role_map = {
+        "carburant_financier": "carburant_financier",
+        "location_materiel": "location_materiel",
+        "maintenance": "maintenance",
+        "dechets_financier": "dechets_financier",
+        "fret_financier": "fret_financier",
+        "deplacements_financiers": "deplacements_financiers",
+        "immobilisations": "immobilisations",
+        "fournitures": "fournitures",
+    }
+    if role in role_map:
+        return role_map[role]
+
+    if role == "services":
+        return None
+
+    if role == "achats_intrants":
+        precise_words = [
+            "beton", "béton", "ciment", "mortier", "acier", "armature",
+            "metallique", "métallique", "bois", "granulat", "grave",
+            "sable", "terre", "pave", "pavé", "bordure", "emballage",
+        ]
+        return "achats_intrants_precis" if any(w in designation for w in precise_words) else None
+
+    if any(w in designation for w in ["beton", "béton", "ciment", "acier", "bois", "granulat", "grave", "sable", "terre", "pave", "pavé", "bordure"]):
+        return "achats_intrants_precis"
+    if any(w in designation for w in ["epi", "fourniture", "petit materiel", "petit matériel", "admin"]):
+        return "fournitures"
+    if any(w in designation for w in ["location", "outillage", "materiel loue", "matériel loué"]):
+        return "location_materiel"
+    if any(w in designation for w in ["maintenance", "entretien", "reparation", "réparation"]):
+        return "maintenance"
+    if any(w in designation for w in ["dechet", "déchet", "evacuation", "évacuation", "traitement"]):
+        return "dechets_financier"
+    if any(w in designation for w in ["fret", "transport", "livraison"]):
+        return "fret_financier"
+    if any(w in designation for w in ["deplacement", "déplacement", "mission", "train", "avion", "hotel", "hôtel"]):
+        return "deplacements_financiers"
+    if "immobilisation" in designation:
+        return "immobilisations"
+
+    return None
+
+
+def facteur_monetaire_variable(entry: dict) -> dict | None:
+    """Retourne le facteur min/central/max à utiliser pour un montant en euros."""
+    if not unit_is_financial(str(entry.get("unite", ""))):
+        return None
+
+    categorie = categorie_monetaire_variable(entry)
+    if not categorie:
+        return None
+
+    f_min = _safe_float(entry.get("facteur_monet_min"))
+    f_def = _safe_float(entry.get("facteur_monet_defaut"))
+    f_max = _safe_float(entry.get("facteur_monet_max"))
+    incertitude = _safe_float(entry.get("incertitude_monetaire"))
+    source = str(entry.get("raison_monetaire") or "estimation monétaire variable")
+
+    if f_min is None or f_def is None or f_max is None:
+        profile = FACTEURS_MONETAIRES_VARIABLES.get(categorie)
+        if not profile or not profile.get("autorise"):
+            return None
+        f_min = float(profile["facteur_min"])
+        f_def = float(profile["facteur_defaut"])
+        f_max = float(profile["facteur_max"])
+        incertitude = float(profile["incertitude"])
+        source = str(profile["source"])
+
+    if f_min <= 0 or f_def <= 0 or f_max <= 0:
+        return None
+
+    if not (f_min <= f_def <= f_max):
+        f_min, f_def, f_max = sorted([f_min, f_def, f_max])
+
+    return {
+        "categorie": categorie,
+        "facteur_min": f_min,
+        "facteur_defaut": f_def,
+        "facteur_max": f_max,
+        "unite": "kgCO2e/€",
+        "incertitude": incertitude if incertitude is not None else 85.0,
+        "source": source,
+    }
+
+
 def calculer_emissions(data_extraite: list[dict]) -> tuple[list[dict], list[dict]]:
     resultats: list[dict] = []
     non_calcules: list[dict] = []
@@ -503,121 +758,82 @@ def calculer_emissions(data_extraite: list[dict]) -> tuple[list[dict], list[dict
         desig_norm = norm(designation)
         unite_norm = norm_unit(unite)
 
-        # Carburant exprimé en euros : conversion explicite en litres estimés.
-        if (
-            unit_is_financial(unite)
-            and norm(role) == "carburant_financier"
-            and scope in {"SCOPE_1", "SCOPE_3"}
-        ):
-            montant_eur = q * 1000 if norm_unit(unite) in {"keuro", "k€"} else q
-            litres_estimes = montant_eur / PRIX_CARBURANT_EUR_PAR_L
-            em_kg = litres_estimes * FE_GAZOLE_KGCO2E_PAR_L
-            facteur_euro = FE_GAZOLE_KGCO2E_PAR_L / PRIX_CARBURANT_EUR_PAR_L
-
-            print(
-                f"  [OK CARBURANT €] {montant_eur:g} € / "
-                f"{PRIX_CARBURANT_EUR_PAR_L:.2f} €/L = {litres_estimes:.1f} L "
-                f"→ {em_kg:.2f} kgCO2e"
-            )
-            resultats.append(
-                _make_result(
-                    source,
-                    "SCOPE_1",
-                    designation,
-                    montant_eur,
-                    "€",
-                    facteur_euro,
-                    "kgCO2e/€ estimé",
-                    em_kg,
-                    "faible",
-                    65,
-                    "estimation carburant en Scope 1 : prix moyen configurable et FE gazole",
+        # Blocage strict des postes mis en revue par extract_files_data_ideal.py.
+        if unite_norm == "revue_manuelle" or entry.get("calcul_automatique_interdit") is True:
+            montant_original = _safe_float(entry.get("montant_eur_original"), q) or q
+            unite_originale = str(entry.get("unite_originale") or unite)
+            print(f"  [REVUE MANUELLE] {designation} ({montant_original:g} {unite_originale})")
+            non_calcules.append(
+                _make_nc(
+                    source, scope, designation, montant_original, unite_originale,
+                    str(entry.get("raison_monetaire") or "Poste trop large : ventilation ou validation manuelle obligatoire"),
                 )
             )
             continue
 
+        # Si une source contient déjà des litres carburant, on évite de compter
+        # en plus une ligne carburant en euros issue du même fichier.
+        if source in sources_litres and unit_is_financial(unite) and "carburant" in desig_norm:
+            print(f"  [SKIP € CARBURANT] {designation} : litres déjà présents dans {source}")
+            continue
 
-        # Compatibilité avec l'ancien calcul :
-        # une catégorie large est calculée lorsqu'un facteur monétaire explicite
-        # existe déjà dans FACTEURS_MONETAIRES_DIRECTS.
-        # Elle reste en revue uniquement lorsqu'aucun facteur n'est configuré.
-        if poste_comptable_trop_large(entry):
-            facteur_large = facteur_financier_direct(designation, unite)
-            if facteur_large is None:
-                print(f"  [REVUE COMPTA] {designation} ({q:g} {unite})")
-                non_calcules.append(
-                    _make_nc(
-                        source, scope, designation, q, unite,
-                        "Catégorie comptable trop large sans facteur configuré"
-                    )
-                )
-                continue
-
-        # Les postes explicitement signalés comme incertains restent en revue,
-        # sauf si un facteur monétaire contrôlé existe déjà pour cette désignation.
-        if entry.get("calcul_automatique_interdit") is True:
-            facteur_autorise = facteur_financier_direct(designation, unite)
-            if facteur_autorise is None:
-                print(f"  [REVUE REQUISE] {designation} ({q:g} {unite})")
-                non_calcules.append(
-                    _make_nc(
-                        source, scope, designation, q, unite,
-                        "Poste comptable nécessitant une ventilation ou une validation manuelle"
-                    )
-                )
-                continue
-
-        # Montants Scope 3 : calcul contrôlé uniquement si le poste est catégorisé.
+        # Nouvelle règle centrale : un montant financier ne passe que par la
+        # logique variable min/central/max. Aucun ancien facteur fixe direct.
         if unit_is_financial(unite):
-            facteur_fin = facteur_financier_direct(designation, unite)
-            if scope == "SCOPE_3" and facteur_fin is not None:
-                valeur_fin, unite_fin, source_fin = facteur_fin
-                montant_eur = q * 1000 if norm_unit(unite) in {"keuro", "k€"} else q
+            facteur_fin = facteur_monetaire_variable(entry)
+            montant_eur = montant_en_euros(q, unite)
 
-                if montant_eur > 20_000_000:
-                    print(f"  [SKIP FIN ABERRANT] {designation} : {montant_eur:.2f} €")
-                    non_calcules.append(
-                        _make_nc(
-                            source, scope, designation, montant_eur, "€",
-                            "Montant financier aberrant supérieur à 20 M€"
-                        )
-                    )
-                    continue
-
-                em_kg = montant_eur * valeur_fin
-                print(f"  [OK €] {designation[:45]} → {montant_eur:g} € × {valeur_fin:.6f} = {em_kg:.2f} kgCO2e")
-                incert_fin = 50
-                d_fin = norm(designation)
-
-                if "achats materiels non detailles" in d_fin or "achats matériels non détaillés" in d_fin:
-                    incert_fin = 80
-
-                for key, (_value, _unit, _source, configured_uncertainty) in FACTEURS_MONETAIRES_PRECIS.items():
-                    if norm(key) in d_fin:
-                        incert_fin = configured_uncertainty
-                        break
-
-                resultats.append(
-                    _make_result(
-                        source, scope, designation, montant_eur, "€",
-                        valeur_fin, unite_fin, em_kg, fiabilite,
-                        incert_fin, source_fin
-                    )
-                )
+            if montant_eur > 20_000_000:
+                print(f"  [SKIP FIN ABERRANT] {designation} : {montant_eur:.2f} €")
+                non_calcules.append(_make_nc(source, scope, designation, montant_eur, "€", "Montant financier supérieur à 20 M€ : validation manuelle"))
                 continue
-            print(f"  [SKIP FIN] {designation} ({unite})")
+
+            if facteur_fin is None:
+                print(f"  [REVUE FIN] {designation} ({montant_eur:g} €)")
+                non_calcules.append(_make_nc(source, scope, designation, montant_eur, "€", "Montant financier trop large ou catégorie non reconnue"))
+                continue
+
+            em_min = montant_eur * float(facteur_fin["facteur_min"])
+            em_kg = montant_eur * float(facteur_fin["facteur_defaut"])
+            em_max = montant_eur * float(facteur_fin["facteur_max"])
+            print(
+                f"  [OK € VARIABLE] {designation[:42]} → {montant_eur:g} € × "
+                f"{facteur_fin['facteur_defaut']:.4f} = {em_kg:.2f} kgCO2e "
+                f"[{em_min:.2f} ; {em_max:.2f}]"
+            )
+
+            resultats.append(
+                _make_result(
+                    source, scope, designation, montant_eur, "€",
+                    float(facteur_fin["facteur_defaut"]), facteur_fin["unite"],
+                    em_kg, "faible", facteur_fin["incertitude"], facteur_fin["source"],
+                    extra={
+                        "methode_calcul": "monétaire variable",
+                        "categorie_monetaire": facteur_fin["categorie"],
+                        "facteur_min": facteur_fin["facteur_min"],
+                        "facteur_max": facteur_fin["facteur_max"],
+                        "emissions_min_kgCO2e": em_min,
+                        "emissions_max_kgCO2e": em_max,
+                        "emissions_min_tCO2e": em_min * KG_TO_T,
+                        "emissions_max_tCO2e": em_max * KG_TO_T,
+                    },
+                )
+            )
             continue
 
         if designation_financiere(designation, unite):
             print(f"  [SKIP FIN] {designation} ({unite})")
+            non_calcules.append(_make_nc(source, scope, designation, q, unite, "Libellé financier sans unité financière exploitable"))
             continue
 
         if unite_non_physique(unite):
             print(f"  [SKIP UNITÉ] {designation} ({unite})")
+            non_calcules.append(_make_nc(source, scope, designation, q, unite, "Unité non physique ou non exploitable"))
             continue
 
         if est_materiau_client(designation) and not role_achat_intrant(entry):
             print(f"  [SKIP CLIENT] {designation}")
+            non_calcules.append(_make_nc(source, scope, designation, q, unite, "Matériau client non confirmé comme achat/intrant"))
             continue
 
         if est_fret_lourd_hallucine(designation, source):
@@ -625,14 +841,25 @@ def calculer_emissions(data_extraite: list[dict]) -> tuple[list[dict], list[dict
             non_calcules.append(_make_nc(source, scope, designation, q, unite, "Fret lourd non confirmé par le fichier source"))
             continue
 
-        # Si un fichier contient litres carburant + km véhicules, les litres priment.
         if source in sources_litres and unite_norm == "km" and any(m in desig_norm for m in MOTS_VEHICULE):
             print(f"  [SKIP KM] {designation} : litres carburant déjà présents dans {source}")
             continue
 
         em_calc = kg_deja_calcule(q, unite)
         if em_calc is not None:
-            resultats.append(_make_result(source, scope, designation, q, unite, 1.0, unite, em_calc, fiabilite, 0, "déjà calculé"))
+            resultats.append(
+                _make_result(
+                    source, scope, designation, q, unite, 1.0, unite, em_calc,
+                    fiabilite, 0, "déjà calculé",
+                    extra={
+                        "methode_calcul": "déjà calculé",
+                        "emissions_min_kgCO2e": em_calc,
+                        "emissions_max_kgCO2e": em_calc,
+                        "emissions_min_tCO2e": em_calc * KG_TO_T,
+                        "emissions_max_tCO2e": em_calc * KG_TO_T,
+                    },
+                )
+            )
             print(f"  [OK déjà] {designation[:45]} → {em_calc:.2f} kgCO2e")
             continue
 
@@ -656,7 +883,6 @@ def calculer_emissions(data_extraite: list[dict]) -> tuple[list[dict], list[dict
         designation_fe = facteur.get("designation", "")
         designation_fe_norm = norm(designation_fe)
 
-        # Garde-fou famille : déchets verts ne doivent jamais matcher fioul/carburants.
         if any(m in desig_norm for m in ["dechets verts", "déchets verts"]) and any(m in designation_fe_norm for m in ["fioul", "gazole", "diesel", "carburant"]):
             fallback_dv = facteur_fallback("dechets verts", unite)
             if fallback_dv:
@@ -666,7 +892,6 @@ def calculer_emissions(data_extraite: list[dict]) -> tuple[list[dict], list[dict
                 incertitude = facteur.get("incertitude", 40)
                 source_fe = facteur.get("source", "fallback contrôlé")
                 designation_fe = facteur.get("designation", "Déchets verts - compostage (fallback)")
-                designation_fe_norm = norm(designation_fe)
                 print("    [FE corrigé] Déchets verts : rejet du match fioul, fallback compostage")
             else:
                 non_calcules.append(_make_nc(source, scope, designation, q, unite, "Mauvais FE déchets verts"))
@@ -682,7 +907,6 @@ def calculer_emissions(data_extraite: list[dict]) -> tuple[list[dict], list[dict
             non_calcules.append(_make_nc(source, scope, designation, q, unite, f"FE nul ou négatif : {valeur_fe}"))
             continue
 
-        # Garde-fou central : jamais de t.km appliqué à des km sans charge réelle.
         if fe_unit_tkm(unite_fe) and unite_norm == "km":
             print(f"  [SKIP t.km] {designation} : FE en {unite_fe}, quantité en km, charge inconnue")
             non_calcules.append(_make_nc(source, scope, designation, q, unite, "FE t.km incompatible avec km sans tonnage réel"))
@@ -694,7 +918,6 @@ def calculer_emissions(data_extraite: list[dict]) -> tuple[list[dict], list[dict
             non_calcules.append(_make_nc(source, scope, designation, q, unite, f"Unité incompatible : FE={unite_fe}, qté={unite}"))
             continue
 
-        # Garde-fous de vraisemblance sur les FE unitaires.
         if unite_norm == "kwh" and valeur_conv > 5:
             non_calcules.append(_make_nc(source, scope, designation, q, unite, f"FE électricité aberrant : {valeur_conv} kgCO2e/kWh"))
             print(f"  [SKIP FE] FE électricité aberrant : {valeur_conv}")
@@ -714,15 +937,28 @@ def calculer_emissions(data_extraite: list[dict]) -> tuple[list[dict], list[dict
             f" | FE: {str(designation_fe)[:45]} ({unite_conv})"
         )
 
-        resultats.append(_make_result(source, scope, designation, q, unite, valeur_conv, unite_conv, em_kg, fiabilite, incertitude, source_fe))
+        resultats.append(
+            _make_result(
+                source, scope, designation, q, unite, valeur_conv, unite_conv,
+                em_kg, fiabilite, incertitude, source_fe,
+                extra={
+                    "methode_calcul": "physique ADEME/fallback",
+                    "designation_facteur": designation_fe,
+                    "emissions_min_kgCO2e": em_kg,
+                    "emissions_max_kgCO2e": em_kg,
+                    "emissions_min_tCO2e": em_kg * KG_TO_T,
+                    "emissions_max_tCO2e": em_kg * KG_TO_T,
+                },
+            )
+        )
 
     return resultats, non_calcules
 
 
 def _make_result(source: str, scope: str, designation: str, quantite: float, unite: str,
                  fe: float, unite_fe: str, em_kg: float, fiabilite: str,
-                 incert: Any, source_fe: str) -> dict:
-    return {
+                 incert: Any, source_fe: str, extra: dict | None = None) -> dict:
+    row = {
         "source": source,
         "scope": scope,
         "designation": designation,
@@ -736,6 +972,18 @@ def _make_result(source: str, scope: str, designation: str, quantite: float, uni
         "fiabilite": fiabilite,
         "source_facteur": source_fe,
     }
+    if extra:
+        for key, value in extra.items():
+            if isinstance(value, float):
+                row[key] = round(value, 6)
+            else:
+                row[key] = value
+    row.setdefault("methode_calcul", "physique ADEME/fallback")
+    row.setdefault("emissions_min_kgCO2e", row["emissions_kgCO2e"])
+    row.setdefault("emissions_max_kgCO2e", row["emissions_kgCO2e"])
+    row.setdefault("emissions_min_tCO2e", row["emissions_tCO2e"])
+    row.setdefault("emissions_max_tCO2e", row["emissions_tCO2e"])
+    return row
 
 
 def _make_nc(source: str, scope: str, designation: str, quantite: float, unite: str, raison: str) -> dict:
@@ -753,6 +1001,8 @@ def agreger_par_scope(resultats: list[dict]) -> dict:
     agregat = defaultdict(lambda: {
         "emissions_kgCO2e": 0.0,
         "emissions_tCO2e": 0.0,
+        "emissions_min_kgCO2e": 0.0,
+        "emissions_max_kgCO2e": 0.0,
         "nb_sources": 0,
         "incertitudes": [],
         "details": [],
@@ -760,8 +1010,14 @@ def agreger_par_scope(resultats: list[dict]) -> dict:
 
     for r in resultats:
         s = r.get("scope", "SCOPE_INCONNU")
-        agregat[s]["emissions_kgCO2e"] += float(r["emissions_kgCO2e"])
-        agregat[s]["emissions_tCO2e"] += float(r["emissions_tCO2e"])
+        kg = float(r.get("emissions_kgCO2e", 0) or 0)
+        kg_min = float(r.get("emissions_min_kgCO2e", kg) or kg)
+        kg_max = float(r.get("emissions_max_kgCO2e", kg) or kg)
+
+        agregat[s]["emissions_kgCO2e"] += kg
+        agregat[s]["emissions_tCO2e"] += kg * KG_TO_T
+        agregat[s]["emissions_min_kgCO2e"] += kg_min
+        agregat[s]["emissions_max_kgCO2e"] += kg_max
         agregat[s]["nb_sources"] += 1
         if r.get("incertitude") not in (None, ""):
             try:
@@ -772,20 +1028,32 @@ def agreger_par_scope(resultats: list[dict]) -> dict:
 
     bilan: dict = {}
     total_kg = 0.0
+    total_min = 0.0
+    total_max = 0.0
     for scope, data in sorted(agregat.items()):
         incert_moy = sum(data["incertitudes"]) / len(data["incertitudes"]) if data["incertitudes"] else 0.0
         bilan[scope] = {
             "emissions_kgCO2e": round(data["emissions_kgCO2e"], 4),
             "emissions_tCO2e": round(data["emissions_tCO2e"], 6),
+            "emissions_min_kgCO2e": round(data["emissions_min_kgCO2e"], 4),
+            "emissions_max_kgCO2e": round(data["emissions_max_kgCO2e"], 4),
+            "emissions_min_tCO2e": round(data["emissions_min_kgCO2e"] * KG_TO_T, 6),
+            "emissions_max_tCO2e": round(data["emissions_max_kgCO2e"] * KG_TO_T, 6),
             "nb_sources": data["nb_sources"],
             "incertitude_moy": round(incert_moy, 2),
             "details": data["details"],
         }
         total_kg += data["emissions_kgCO2e"]
+        total_min += data["emissions_min_kgCO2e"]
+        total_max += data["emissions_max_kgCO2e"]
 
     bilan["TOTAL"] = {
         "emissions_kgCO2e": round(total_kg, 4),
         "emissions_tCO2e": round(total_kg * KG_TO_T, 6),
+        "emissions_min_kgCO2e": round(total_min, 4),
+        "emissions_max_kgCO2e": round(total_max, 4),
+        "emissions_min_tCO2e": round(total_min * KG_TO_T, 6),
+        "emissions_max_tCO2e": round(total_max * KG_TO_T, 6),
     }
     return bilan
 
@@ -841,13 +1109,27 @@ def afficher_bilan(bilan: dict, incertitude: dict) -> None:
         print(f"\n  {scope}")
         print(f"  {'─' * 48}")
         for d in data.get("details", []):
-            print(f"    {d['designation'][:38]:<38} {d['emissions_tCO2e']:>10.4f} tCO2e")
+            methode = str(d.get("methode_calcul", ""))
+            suffix = ""
+            if methode.startswith("monétaire"):
+                suffix = "  [€ variable]"
+            print(f"    {d['designation'][:38]:<38} {d['emissions_tCO2e']:>10.4f} tCO2e{suffix}")
         print(f"  {'SOUS-TOTAL':>48} : {data['emissions_tCO2e']:>10.4f} tCO2e")
+        if data.get("emissions_min_tCO2e") != data.get("emissions_max_tCO2e"):
+            print(
+                f"  {'fourchette':>48} : "
+                f"{data.get('emissions_min_tCO2e', 0):>10.4f} → {data.get('emissions_max_tCO2e', 0):.4f} tCO2e"
+            )
 
     total = bilan.get("TOTAL", {})
     print("\n" + "═" * 72)
     print(f"  TOTAL GÉNÉRAL : {total.get('emissions_tCO2e', 0):.4f} tCO2e")
     print(f"                  {total.get('emissions_kgCO2e', 0):.2f} kgCO2e")
+    if total.get("emissions_min_tCO2e") != total.get("emissions_max_tCO2e"):
+        print(
+            f"  FOURCHETTE     : {total.get('emissions_min_tCO2e', 0):.4f} "
+            f"→ {total.get('emissions_max_tCO2e', 0):.4f} tCO2e"
+        )
     print("═" * 72)
     print("\n  INCERTITUDE")
     print(f"  Facteurs d'émission : ±{incertitude['incertitude_facteurs_%']}%")
