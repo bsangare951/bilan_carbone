@@ -71,7 +71,7 @@ def classify_by_rules(filename: str, text: str) -> str | None:
     blob = f"{fn} {tx}"
 
     # Fichiers générés par l'outil : jamais source d'activité.
-    if any(k in fn for k in ["audit_extraction", "audit_rejets", "resume", "résumé"]):
+    if any(k in fn for k in ["audit_extraction", "audit_rejets", "resume", "résumé","synthèse"]):
         return "USELESS"
 
     # Certains noms de fichiers sont suffisants même si le texte est vide
@@ -177,7 +177,7 @@ def extract_text(path: str, max_chars: int = 1500) -> str:
         print(f"  [ERREUR EXTRACT] {path}: {e}")
     return ""
 
-def run_test(folder: str = "cleaned_files", threshold: float = 0.40) -> dict[str, str]:
+def run_test(folder: str = "cleaned_files", threshold: float = 0.20) -> dict[str, str]:
     results: dict[str, str] = {}
     if not os.path.exists(folder):
         print(f"[ERREUR] Dossier introuvable : {folder}")
@@ -333,7 +333,7 @@ def export_per_scope(
             print(f"  [ERREUR COPIE] {fname}: {e}")
 
 if __name__ == "__main__":
-    results = run_test(threshold=0.40)
+    results = run_test(threshold=0.20)
     export_per_scope(results, clean_before_export=True)
     print("\nRÉSULTATS FINAUX")
     for scope in ("SCOPE_1", "SCOPE_2", "SCOPE_3"):

@@ -1,3 +1,4 @@
+from docx import Document
 import pandas as pd
 import os
 import re
@@ -335,16 +336,94 @@ def clean_DOCX(datas):
         if str(content.get("type", "")).lower() != "docx":
             continue
 
-        basename = Path(filename).name
-        clean_basename = f"cleaned_{basename}"
+        basename = Path(filename).stem
+        clean_basename = f"cleaned_{basename}.txt"
         save_path = _out_path(filename, clean_basename)
 
         try:
             source_path = _original_path(content, filename)
-            shutil.copy2(source_path, save_path)
-            print(f"[OK] DOCX '{filename}' copié : {save_path}")
+            document = Document(source_path)
+
+            extracted_lines = []
+
+            # Paragraphes du document
+            for paragraph in document.paragraphs:
+                text = paragraph.text.strip()
+
+                if text:
+                    extracted_lines.append(text)
+
+            # Tableaux du document
+            for table in document.tables:
+                for row in table.rows:
+                    cells = []
+
+                    for cell in row.cells:
+                        cell_text = " ".join(
+                            paragraph.text.strip()
+                            for paragraph in cell.paragraphs
+                            if paragraph.text.strip()
+                        )
+
+                        cells.append(cell_text)
+
+                    if any(cells):
+                        extracted_lines.append(" | ".join(cells))
+
+            # En-têtes et pieds de page
+            processed_headers = set()
+            processed_footers = set()
+
+            for section in document.sections:
+                header_id = id(section.header)
+                footer_id = id(section.footer)
+
+                if header_id not in processed_headers:
+                    processed_headers.add(header_id)
+
+                    for paragraph in section.header.paragraphs:
+                        text = paragraph.text.strip()
+
+                        if text:
+                            extracted_lines.append(text)
+
+                if footer_id not in processed_footers:
+                    processed_footers.add(footer_id)
+
+                    for paragraph in section.footer.paragraphs:
+                        text = paragraph.text.strip()
+
+                        if text:
+                            extracted_lines.append(text)
+
+            # Suppression des lignes vides et des doublons successifs
+            cleaned_lines = []
+            previous_line = None
+
+            for line in extracted_lines:
+                line = " ".join(line.split())
+
+                if not line:
+                    continue
+
+                if line == previous_line:
+                    continue
+
+                cleaned_lines.append(line)
+                previous_line = line
+
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+
+            with open(save_path, "w", encoding="utf-8") as file:
+                file.write("\n".join(cleaned_lines))
+
+            print(
+                f"[OK] DOCX '{filename}' nettoyé en TXT : "
+                f"{save_path} ({len(cleaned_lines)} ligne(s))"
+            )
+
         except Exception as e:
-            print(f"[ERREUR] DOCX {filename} : {e}")
+            print(f"[ERREUR] DOCX '{filename}' : {e}")
 
     return datas
 

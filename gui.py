@@ -63,96 +63,206 @@ class BilanCarboneGUI:
 
 
     def setup_ui(self):
-        T = self.TRANSP
+        self.main = tk.Frame(self.root, bg="#0F0F11")
+        self.main.place(
+            relx=0.5,
+            rely=0.5,
+            anchor="center",
+            width=1000,
+            height=575
+        )
 
-        self.main = tk.Frame(self.root, bg="#495899")
-        self.main.place(relx=0.5, rely=0.5, anchor="center", width=1000, height=600)
+        tk.Label(
+            self.main,
+            text="🌿  Bilan Carbone Automatisé",
+            font=("Arial", 22, "bold"),
+            bg="#2B2A2A",
+            fg="white",
+            padx=10,
+            pady=5
+        ).pack(pady=(10, 5))
 
-        tk.Label(self.main, text="🌿  Bilan Carbone Automatisé",
-                 font=("Arial", 22, "bold"), bg="#6841FF", fg="white",
-                 padx=10, pady=5).pack(pady=(10, 5))
+        tk.Label(
+            self.main,
+            text="Outil de calcul des émissions GHG Protocol — ADEME",
+            font=("Arial", 10, "italic"),
+            bg="#1D1B1B",
+            fg="#dfe6e9"
+        ).pack(pady=(0, 15))
 
-        tk.Label(self.main,
-                 text="Outil de calcul des émissions GHG Protocol — ADEME",
-                 font=("Arial", 10, "italic"), bg="#971515",
-                 fg="#dfe6e9").pack(pady=(0, 15))
-
-        btn_frame = tk.Frame(self.main, bg="#000874")
+        btn_frame = tk.Frame(self.main, bg="#000000")
         btn_frame.pack(pady=5)
 
-        btn_cfg = {"width": 26, "height": 2, "font": ("Arial", 10, "bold"),
-                   "relief": "flat", "cursor": "hand2", "bd": 0}
+        btn_cfg = {
+            "width": 26,
+            "height": 2,
+            "font": ("Arial", 10, "bold"),
+            "relief": "flat",
+            "cursor": "hand2",
+            "bd": 0,
+            "fg": "black",
+            "activeforeground": "black",
+            "disabledforeground": "black"
+        }
 
         self.btn_choisir = tk.Button(
-            btn_frame, text="📁  1. Choisir le dossier",
-            command=self.choisir_dossier, bg="#2980b9", fg="white", **btn_cfg)
+            btn_frame,
+            text="📁  1. Choisir le dossier",
+            command=self.choisir_dossier,
+            bg="#2980b9",
+            activebackground="#3498db",
+            **btn_cfg
+        )
         self.btn_choisir.grid(row=0, column=0, padx=6, pady=4)
 
         self.btn_nettoyer = tk.Button(
-            btn_frame, text="🧹  2. Nettoyer les fichiers",
-            command=self.lancer_nettoyage, bg="#27ae60", fg="white",
-            state=tk.DISABLED, **btn_cfg)
+            btn_frame,
+            text="🧹  2. Nettoyer les fichiers",
+            command=self.lancer_nettoyage,
+            bg="#27ae60",
+            activebackground="#2ecc71",
+            state=tk.DISABLED,
+            **btn_cfg
+        )
         self.btn_nettoyer.grid(row=0, column=1, padx=6, pady=4)
 
         self.btn_mapper = tk.Button(
-            btn_frame, text="🗂️  3. Classifier par scope",
-            command=self.lancer_mapping, bg="#e67e22", fg="white",
-            state=tk.DISABLED, **btn_cfg)
+            btn_frame,
+            text="🗂️  3. Classifier par scope",
+            command=self.lancer_mapping,
+            bg="#e67e22",
+            activebackground="#f39c12",
+            state=tk.DISABLED,
+            **btn_cfg
+        )
         self.btn_mapper.grid(row=0, column=2, padx=6, pady=4)
 
         self.btn_calculer = tk.Button(
-            btn_frame, text="⚡  4. Calculer les émissions",
-            command=self.lancer_calcul, bg="#c0392b", fg="white",
-            state=tk.DISABLED, **btn_cfg)
+            btn_frame,
+            text="⚡  4. Calculer les émissions",
+            command=self.lancer_calcul,
+            bg="#c0392b",
+            activebackground="#e74c3c",
+            state=tk.DISABLED,
+            **btn_cfg
+        )
         self.btn_calculer.grid(row=0, column=3, padx=6, pady=4)
 
-        self.label_dossier = tk.Label(self.main,
-                                      text="Aucun dossier sélectionné",
-                                      font=("Arial", 9), bg="#942328", fg="white")
+        self.label_dossier = tk.Label(
+            self.main,
+            text="Aucun dossier sélectionné",
+            font=("Arial", 9),
+            bg="#942328",
+            fg="white",
+            padx=8,
+            pady=3
+        )
         self.label_dossier.pack(pady=(5, 2))
 
-        log_outer = tk.Frame(self.main, bg="white", bd=1, relief="solid")
-        log_outer.pack(fill=tk.BOTH, expand=True, padx=5, pady=8)
+        log_outer = tk.Frame(
+            self.main,
+            bg="white",
+            bd=1,
+            relief="solid"
+        )
+        log_outer.pack(
+            fill=tk.BOTH,
+            expand=True,
+            padx=5,
+            pady=8
+        )
 
-        tk.Label(log_outer, text="Journal d'exécution",
-                 font=("Arial", 9, "bold"), bg="white",
-                 fg="white").pack(fill=tk.X, padx=8, pady=(5, 0))
+        tk.Label(
+            log_outer,
+            text="Journal d'exécution",
+            font=("Arial", 9, "bold"),
+            bg="white",
+            fg="black"
+        ).pack(fill=tk.X, padx=8, pady=(5, 0))
 
         self.log_text = scrolledtext.ScrolledText(
-            log_outer, width=110, height=16, font=("Courier", 9),
-            bg="#f8f9fa", fg="#000000", relief="flat", bd=0)
-        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
+            log_outer,
+            width=110,
+            height=16,
+            font=("Courier", 9),
+            bg="#f8f9fa",
+            fg="#000000",
+            insertbackground="black",
+            relief="flat",
+            bd=0
+        )
+        self.log_text.pack(
+            fill=tk.BOTH,
+            expand=True,
+            padx=5,
+            pady=(0, 5)
+        )
 
-        res_frame = tk.Frame(self.main, bg="white", bd=1, relief="solid")
-        res_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
+        self.log_text.config(state=tk.DISABLED)
 
-        self.result_label = tk.Label(res_frame, text="",
-                                     font=("Arial", 18, "bold"),
-                                     fg="#27ae60", bg="white")
+        res_frame = tk.Frame(
+            self.main,
+            bg="white",
+            bd=1,
+            relief="solid"
+        )
+        res_frame.pack(
+            fill=tk.X,
+            padx=5,
+            pady=(0, 5)
+        )
+
+        self.result_label = tk.Label(
+            res_frame,
+            text="",
+            font=("Arial", 18, "bold"),
+            fg="#27ae60",
+            bg="white"
+        )
         self.result_label.pack(pady=(8, 2))
 
-        self.detail_label = tk.Label(res_frame, text="",
-                                     font=("Arial", 10), fg="#555", bg="white")
+        self.detail_label = tk.Label(
+            res_frame,
+            text="",
+            font=("Arial", 10),
+            fg="#555",
+            bg="white"
+        )
         self.detail_label.pack(pady=(0, 8))
 
-        tk.Label(self.main,
-                 text=f"© {datetime.now().year}  HDQUALITE — Outil Bilan Carbone",
-                 font=("Arial", 8), bg="#942238", fg="white").pack(pady=(5, 0))
+        tk.Label(
+            self.main,
+            text=f"© {datetime.now().year}  HDQUALITE — Outil Bilan Carbone",
+            font=("Arial", 8),
+            bg="#942238",
+            fg="white"
+        ).pack(pady=(5, 0))
 
     # LOGS
 
     def log(self, message, level="INFO"):
-        colors = {"INFO": "#2d3436", "SUCCESS": "#00b894",
-                  "WARNING": "#e17055", "ERROR": "#d63031"}
+        colors = {
+            "INFO": "#2d3436",
+            "SUCCESS": "#00b894",
+            "WARNING": "#e17055",
+            "ERROR": "#d63031",
+        }
+
         timestamp = datetime.now().strftime("%H:%M:%S")
         tag = f"tag_{level}"
+
+        self.log_text.config(state=tk.NORMAL)
+
         self.log_text.tag_config(tag, foreground=colors.get(level, "#2d3436"))
+        self.log_text.tag_config("gray", foreground="#b2bec3")
+
         self.log_text.insert(tk.END, f"[{timestamp}] ", "gray")
         self.log_text.insert(tk.END, f"[{level}] ", tag)
         self.log_text.insert(tk.END, f"{message}\n")
-        self.log_text.tag_config("gray", foreground="#b2bec3")
+
         self.log_text.see(tk.END)
-        self.root.update()
+        self.log_text.config(state=tk.DISABLED)
+        self.root.update_idletasks()
 
     # ACTIONS 
 
